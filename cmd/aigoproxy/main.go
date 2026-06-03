@@ -160,6 +160,25 @@ func main() {
 		close(errCh)
 	}()
 
+	// SIGHUP = graceful config reload (re-reads config.yaml and rebuilds
+	// the proxy route table; connections are not dropped).
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+	go func() {
+		for range hupCh {
+			logger.Info("SIGHUP received, reloading config")
+			if _, err := s.LoadConfig(); err != nil {
+				logger.Error("reload config", "err", err)
+				continue
+			}
+			if err := px.Reload(); err != nil {
+				logger.Error("reload proxy", "err", err)
+				continue
+			}
+			logger.Info("reload complete", "routes", len(s.Config().Routes))
+		}
+	}()
+
 	select {
 	case <-ctx.Done():
 		logger.Info("shutting down")

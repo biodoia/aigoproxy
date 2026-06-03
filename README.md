@@ -107,6 +107,32 @@ tailscale funnel 80 on
 # now app1.biodoia.ts.net works from anywhere
 ```
 
+## 📦 Deployment
+
+```bash
+# build + install as systemd user service (recommended for h24)
+./deploy/install.sh
+
+# status / logs
+systemctl --user status aigoproxy
+journalctl --user -u aigoproxy -f
+
+# apply config changes (SIGHUP, no restart)
+systemctl --user reload aigoproxy
+
+# uninstall
+./deploy/uninstall.sh            # keeps config
+./deploy/uninstall.sh --purge    # nukes everything
+```
+
+The systemd unit:
+
+- binds :80 (via `AmbientCapabilities=CAP_NET_BIND_SERVICE` — no root)
+- runs `tailscale funnel 80 on` after start (idempotent)
+- enables systemd-lingering so the daemon survives logout
+- hardens the process (ProtectSystem, PrivateTmp, no new privs, etc.)
+- sends SIGTERM for graceful stop, SIGHUP for config reload
+
 ## 🎯 Why?
 
 Tailscale Funnel is great but it exposes a single port. If you run three

@@ -1,0 +1,56 @@
+# aigoproxy.service — systemd user unit
+#
+# Install: see ../install.sh
+# Status:  systemctl --user status aigoproxy
+# Logs:    journalctl --user -u aigoproxy -f
+# Reload:  systemctl --user reload aigoproxy   # sends SIGHUP
+# Stop:    systemctl --user stop aigoproxy
+
+[Unit]
+Description=aigoproxy — Tailscale-aware reverse proxy
+Documentation=https://github.com/biodoia/aigoproxy
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/aigoproxy -addr :80 -config %h/.aigoproxy/config.yaml -data %h/.aigoproxy
+# Tailscale Funnel: bind on :80 then turn on funnel for that port.
+# `tailscale funnel 80 on` is one-shot and persists, but we run it on every
+# start in case the user wiped state.
+ExecStartPost=/usr/bin/tailscale funnel 80 on
+# When the user re-installs or moves the binary, this reload triggers a
+# graceful config reload (SIGHUP).
+ExecReload=/bin/kill -HUP $MAINPID
+# Stop gracefully — give the HTTP server 10s to drain in-flight requests.
+TimeoutStopSec=10s
+KillMode=mixed
+Restart=on-failure
+RestartSec=5s
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+# We bind :80 which is a privileged port. AmbientCapabilities is the
+# modern way without root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aigoproxy
+
+[Install]
+WantedBy=default.target
