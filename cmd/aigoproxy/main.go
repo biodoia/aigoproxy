@@ -43,6 +43,7 @@ import (
 
 var (
 	addr         = flag.String("addr", ":8080", "dashboard + API + MCP + ACP listen address (single port for simplicity)")
+	httpsAddr    = flag.String("https", "", "optional HTTPS listen address (e.g. :443) — uses Tailscale-issued cert for the node's <node>.<tailnet>.ts.net")
 	configPath   = flag.String("config", defaultConfig(), "path to config.yaml")
 	dataDir      = flag.String("data", defaultData(), "data directory (state, certs, logs)")
 	enableTUI    = flag.Bool("tui", false, "start the TUI in this process (interactive)")
@@ -170,6 +171,23 @@ func main() {
 		}
 		close(errCh)
 	}()
+
+	// 11. HTTPS listener (optional). Auto-provisions a Tailscale cert for
+	// the node's <node>.<tailnet>.ts.net and serves the same root mux.
+	var httpsSrv *http.Server
+	if *httpsAddr != "" {
+		httpsSrv, err = startHTTPS(ctx, logger, *httpsAddr, root, *dataDir)
+		if err != nil {
+			logger.Warn("https listener disabled", "err", err)
+		} else {
+			go func() {
+				logger.Info("https listening", "addr", *httpsAddr)
+				if err := httpsSrv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+					logger.Error("https serve", "err", err)
+				}
+			}()
+		}
+	}
 
 	// SIGHUP = graceful config reload (re-reads config.yaml and rebuilds
 	// the proxy route table; connections are not dropped).
