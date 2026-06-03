@@ -14,6 +14,7 @@ server + ACP server. Stdlib-only Go where possible.
 [![Single Binary](https://img.shields.io/badge/binary-single-success.svg)]()
 [![MCP: yes](https://img.shields.io/badge/MCP-yes-orange.svg)]()
 [![ACP: yes](https://img.shields.io/badge/ACP-yes-orange.svg)]()
+[![Tests: 40](https://img.shields.io/badge/tests-40%20passing-brightgreen.svg)]()
 
 [Features](#-features) · [Quick Start](#-quick-start) · [Architecture](#-architecture) · [MCP/ACP](#-mcp--acp) · [Docs](docs/) · [Contributing](CONTRIBUTING.md)
 
@@ -188,6 +189,38 @@ Tools: `aigoproxy_list`, `aigoproxy_get`, `aigoproxy_add`, `aigoproxy_remove`,
 
 ACP is the WebSocket variant at `ws://localhost:8080/acp/ws` for
 long-lived agent sessions. Same operations over a persistent connection.
+Server pushes a `welcome` frame on connect, then JSON-RPC 2.0 in both
+directions.
+
+Methods: `ping`, `list_routes`, `get_route`, `add_route`, `remove_route`,
+`log`, `stats`.
+
+## 🔐 Let's Encrypt
+
+aigoproxy ships with a real Let's Encrypt ACME client. It uses the
+**HTTP-01** challenge, which is served at `/.well-known/acme-challenge/*`
+by the main mux (the path is intercepted before the reverse proxy so it
+never hits an upstream).
+
+```bash
+# configure
+export AIGOPROXY_ACME_EMAIL="you@example.com"
+export AIGOPROXY_ACME_STAGING="1"   # 1 = use Let's Encrypt staging, unset = prod
+
+# every registered host gets a cert on first request (via the
+# GetCertificate SNI hook in the TLS config). Certs are cached to
+# ~/.aigoproxy/certs/<host>.pem and renewed automatically 30 days
+# before expiry.
+```
+
+To use the certs, the binary must also bind :443 with TLS configured.
+The current `cmd/aigoproxy/main.go` does not enable the HTTPS listener
+yet — that's a Wave 3 task: add a `tls.Config{GetCertificate: acm.GetCertificate}`
+around the `srv.ListenAndServeTLS` call.
+
+For **DNS-01** (which doesn't need :80 at all and works behind any
+firewall), Wave 4 will add a `DNSProvider` interface and a Cloudflare
+implementation.
 
 📖 [Full MCP/ACP spec →](docs/MCP_ACP.md)
 
