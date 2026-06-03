@@ -100,8 +100,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 4. ACME manager (stub in Wave 1, real in Wave 2)
-	acm := acme.NewManager(*dataDir, logger)
+	// 4. ACME manager
+	acm, err := acme.New(acme.Config{
+		DataDir: *dataDir,
+		Email:   os.Getenv("AIGOPROXY_ACME_EMAIL"),
+		Staging: os.Getenv("AIGOPROXY_ACME_STAGING") == "1",
+		Logger:  logger,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "acme: %v\n", err)
+		os.Exit(1)
+	}
+	// renewal loop started after ctx is created (see below)
 
 	// 5. Servers
 	webuiSrv, err := webui.New(*addr, s, logger)
@@ -122,10 +132,11 @@ func main() {
 	root.Handle("/acp/", acpSrv.Handler())
 	root.Handle("/", combinedHandler(px, webuiSrv, acm, cfg))
 
-	// 7. Health probe loop
+	// 7. Health probe loop + ACME renewal
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	go px.HealthCheckLoop(ctx)
+	go acm.RenewalLoop(ctx)
 
 	// 8. TUI (optional)
 	if *enableTUI {
@@ -193,9 +204,15 @@ func main() {
 
 // combinedHandler routes: dashboard paths → webui, reverse proxy for the rest.
 // /mcp and /acp are registered at the root mux level and take precedence
-// over this handler.
+// over this handler. ACME HTTP-01 challenges are served before the reverse
+// proxy so /.well-known/acme-challenge/* never hits an upstream.
 func combinedHandler(px *proxy.Proxy, webuiSrv *webui.Server, acm *acme.Manager, cfg config.Config) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// ACME HTTP-01 challenge path: serve from in-memory token store
+		if strings.HasPrefix(r.URL.Path, "/.well-known/acme-challenge/") {
+			acm.ChallengeHandler().ServeHTTP(w, r)
+			return
+		}
 		// API + dashboard: webui
 		switch r.URL.Path {
 		case "/", "/routes", "/healthz":
