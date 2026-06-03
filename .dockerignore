@@ -1,0 +1,6 @@
+build/
+bin/
+*.local
+.DS_Store
+coverage.out
+Dockerfile.aigoproxy

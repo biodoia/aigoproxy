@@ -49,6 +49,7 @@ var (
 	enableTUI    = flag.Bool("tui", false, "start the TUI in this process (interactive)")
 	enableFunnel = flag.Bool("funnel", true, "register Tailscale Funnel listeners for routes (requires `tailscale` CLI)")
 	showVersion  = flag.Bool("version", false, "print version and exit")
+	setupMode    = flag.Bool("setup", false, "run interactive setup wizard and exit (creates initial config.yaml)")
 )
 
 func defaultConfig() string {
@@ -67,6 +68,14 @@ func main() {
 	flag.Parse()
 	if *showVersion {
 		fmt.Println("aigoproxy", version)
+		return
+	}
+	if *setupMode {
+		logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+		if err := runSetup(logger); err != nil {
+			fmt.Fprintf(os.Stderr, "setup: %v\n", err)
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -176,16 +185,42 @@ func main() {
 	// the node's <node>.<tailnet>.ts.net and serves the same root mux.
 	var httpsSrv *http.Server
 	if *httpsAddr != "" {
-		httpsSrv, err = startHTTPS(ctx, logger, *httpsAddr, root, *dataDir)
+		ts, err := tailscaleStatus(ctx)
 		if err != nil {
-			logger.Warn("https listener disabled", "err", err)
+			logger.Warn("https listener disabled (no tailscale)", "err", err)
+		} else if ts.DNSName == "" {
+			logger.Warn("https listener disabled (no DNSName in tailscale status)")
 		} else {
-			go func() {
-				logger.Info("https listening", "addr", *httpsAddr)
-				if err := httpsSrv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-					logger.Error("https serve", "err", err)
-				}
-			}()
+			cf, kf, err := ensureTailscaleCert(ctx, logger, ts.DNSName, *dataDir)
+			if err != nil {
+				logger.Warn("https listener disabled (cert)", "err", err)
+			} else {
+				httpsSrv = newHTTPSServer(*httpsAddr, root, cf, kf)
+				go func() {
+					logger.Info("https listening", "addr", *httpsAddr)
+					if err := httpsSrv.ListenAndServeTLS(cf, kf); err != nil && err != http.ErrServerClosed {
+						logger.Error("https serve", "err", err)
+					}
+				}()
+				// watcher: re-provision cert when Tailscale rotates it
+				go watchCert(ctx, logger, cf, kf, func() {
+					ncf, nkf, err := ensureTailscaleCert(ctx, logger, ts.DNSName, *dataDir)
+					if err != nil {
+						logger.Error("cert refresh", "err", err)
+						return
+					}
+					shutCtx, c2 := context.WithTimeout(context.Background(), 5*time.Second)
+					defer c2()
+					_ = httpsSrv.Shutdown(shutCtx)
+					httpsSrv = newHTTPSServer(*httpsAddr, root, ncf, nkf)
+					go func() {
+						logger.Info("https restarted with new cert", "addr", *httpsAddr, "cert", ncf)
+						if err := httpsSrv.ListenAndServeTLS(ncf, nkf); err != nil && err != http.ErrServerClosed {
+							logger.Error("https serve (after refresh)", "err", err)
+						}
+					}()
+				})
+			}
 		}
 	}
 
@@ -231,6 +266,22 @@ func combinedHandler(px *proxy.Proxy, webuiSrv *webui.Server, acm *acme.Manager,
 			acm.ChallengeHandler().ServeHTTP(w, r)
 			return
 		}
+		// Dashboard + API: served when Host is the node's own FQDN (or
+		// empty), so that requests to <route>.<base> are routed to the
+		// reverse proxy without intercepting the dashboard.
+		nodeHosts := nodeLocalHosts(cfg)
+		host := strings.ToLower(r.Host)
+		if i := strings.IndexByte(host, ':'); i >= 0 {
+			host = host[:i]
+		}
+		isLocal := host == "" || host == "localhost" || host == "127.0.0.1" || host == "::1"
+		if !isLocal {
+			if !contains(nodeHosts, host) {
+				// request to a virtual host → reverse proxy
+				px.ServeHTTP(w, r)
+				return
+			}
+		}
 		// API + dashboard: webui
 		switch r.URL.Path {
 		case "/", "/routes", "/healthz":
@@ -245,9 +296,32 @@ func combinedHandler(px *proxy.Proxy, webuiSrv *webui.Server, acm *acme.Manager,
 			webuiSrv.Handler().ServeHTTP(w, r)
 			return
 		}
-		// reverse proxy for everything else (custom virtual hosts)
+		// reverse proxy for everything else on a local host
 		px.ServeHTTP(w, r)
 	})
+}
+
+// nodeLocalHosts returns the FQDN variants the proxy should serve the
+// dashboard on. We include the base domain and the localhost-ish names.
+func nodeLocalHosts(cfg config.Config) []string {
+	// Note: we don't know the node FQDN here without shelling out, so
+	// we only include the base domain. Users who want the dashboard on
+	// their node FQDN can set the host header to localhost from inside
+	// the Tailscale network.
+	out := []string{}
+	if cfg.BaseDomain != "" {
+		out = append(out, cfg.BaseDomain)
+	}
+	return out
+}
+
+func contains(s []string, x string) bool {
+	for _, v := range s {
+		if v == x {
+			return true
+		}
+	}
+	return false
 }
 
 // setupFunnel registers a Tailscale Funnel listener for every route marked

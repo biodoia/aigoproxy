@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Download deps
+        run: go mod download
+
+      - name: Build
+        run: |
+          go build -o /tmp/aigoproxy ./cmd/aigoproxy/
+          file /tmp/aigoproxy
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: |
+          go test -count=1 -race -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out | tail -1
+
+      - name: Upload coverage
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build -t aigoproxy:test .
+      - name: Smoke test
+        run: |
+          docker run --rm -d --name aigoproxy-test -p 8880:80 aigoproxy:test
+          sleep 3
+          curl -sf http://localhost:8880/healthz | grep -q '"status":"ok"'
+          docker stop aigoproxy-test

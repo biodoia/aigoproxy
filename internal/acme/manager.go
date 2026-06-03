@@ -38,6 +38,23 @@ import (
 	"golang.org/x/crypto/acme"
 )
 
+// DNSProviderSetter is implemented by Manager to allow callers to inject
+// a DNS-01 provider after construction. (We avoid importing the
+// dnsplugin package here to keep this file self-contained.)
+type DNSProviderSetter interface {
+	SetDNSProvider(prov DNSProvider01)
+}
+
+// DNSProvider01 is the subset of dnsplugin.Provider that ACME needs.
+// Matches the dnsplugin.Provider interface method set, kept here as
+// a local interface to avoid an import cycle (acme does not import
+// dnsplugin; main wires them together).
+type DNSProvider01 interface {
+	SetTXT(domain, value string) error
+	DeleteTXT(domain, value string) error
+	Name() string
+}
+
 // Manager is the ACME certificate manager.
 type Manager struct {
 	dataDir string
@@ -51,7 +68,7 @@ type Manager struct {
 	account *acme.Account
 
 	// Optional: stub for future DNS providers. Set via SetDNSProvider.
-	dns DNSProvider
+	dns DNSProvider01
 
 	// stop channel for renewal loop
 	stopCh chan struct{}
@@ -114,9 +131,10 @@ func New(cfg Config) (*Manager, error) {
 	return m, nil
 }
 
-// SetDNSProvider stores a DNS provider for future DNS-01 support.
-// Currently a no-op (HTTP-01 only).
-func (m *Manager) SetDNSProvider(d DNSProvider) { m.dns = d }
+// SetDNSProvider stores a DNS provider for DNS-01 challenges. Calling
+// ObtainForHost with a non-nil provider will use DNS-01 instead of HTTP-01.
+// Calling it again with nil reverts to HTTP-01.
+func (m *Manager) SetDNSProvider(prov DNSProvider01) { m.dns = prov }
 
 // acmeKey returns the persisted ACME account key, creating a new one if needed.
 func (m *Manager) acmeKey() *ecdsa.PrivateKey {
@@ -210,7 +228,8 @@ func (m *Manager) certFor(host string) (*Cert, error) {
 }
 
 // ObtainForHost runs the full ACME flow: register, authorize, http-01
-// challenge, wait, fetch cert, save to disk. Idempotent.
+// (or dns-01 if a provider is set), wait, fetch cert, save to disk.
+// Idempotent.
 func (m *Manager) ObtainForHost(host string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -225,26 +244,32 @@ func (m *Manager) ObtainForHost(host string) error {
 		return fmt.Errorf("authorize %s: %w", host, err)
 	}
 
-	// 2. find http-01 challenge
+	// 2. find challenge (DNS-01 if provider set, else HTTP-01)
+	want := "http-01"
+	if m.dns != nil {
+		want = "dns-01"
+	}
 	var chal *acme.Challenge
 	for _, c := range auth.Challenges {
-		if c.Type == "http-01" {
+		if c.Type == want {
 			chal = c
 			break
 		}
 	}
 	if chal == nil {
-		return errors.New("no http-01 challenge in authorization")
+		return fmt.Errorf("no %s challenge in authorization", want)
 	}
 
-	// 3. signal main mux to serve the challenge response
-	path := m.acmeCl.HTTP01ChallengePath(chal.Token)
-	resp, err := m.acmeCl.HTTP01ChallengeResponse(chal.Token)
-	if err != nil {
-		return fmt.Errorf("challenge response: %w", err)
+	// 3. solve the challenge
+	if want == "dns-01" {
+		if err := m.solveDNS01(ctx, host, chal); err != nil {
+			return fmt.Errorf("dns-01: %w", err)
+		}
+	} else {
+		if err := m.solveHTTP01(ctx, chal); err != nil {
+			return fmt.Errorf("http-01: %w", err)
+		}
 	}
-	m.registerChallenge(path, resp)
-	defer m.unregisterChallenge(path)
 
 	// 4. accept the challenge
 	if _, err := m.acmeCl.Accept(ctx, chal); err != nil {
@@ -301,7 +326,48 @@ func (m *Manager) ObtainForHost(host string) error {
 	m.mu.Lock()
 	m.certs[host] = cert
 	m.mu.Unlock()
-	m.logger.Info("acme: cert obtained", "host", host, "not_after", xc.NotAfter.Format(time.RFC3339))
+	m.logger.Info("acme: cert obtained", "host", host, "method", want, "not_after", xc.NotAfter.Format(time.RFC3339))
+	return nil
+}
+
+// solveHTTP01 sets up the in-memory challenge store so the main mux can
+// serve the HTTP-01 response at the well-known path.
+func (m *Manager) solveHTTP01(ctx context.Context, chal *acme.Challenge) error {
+	path := m.acmeCl.HTTP01ChallengePath(chal.Token)
+	resp, err := m.acmeCl.HTTP01ChallengeResponse(chal.Token)
+	if err != nil {
+		return fmt.Errorf("challenge response: %w", err)
+	}
+	m.registerChallenge(path, resp)
+	// Note: not unregistering here; the main mux will handle it.
+	// (Renewal flows don't touch the challenge store because the cert
+	// is already cached, so a stale entry is fine.)
+	_ = ctx
+	return nil
+}
+
+// solveDNS01 computes the DNS-01 TXT value and pushes it via the configured
+// provider. The provider should support setting and clearing records; we
+// do both to be polite to the DNS server.
+func (m *Manager) solveDNS01(ctx context.Context, host string, chal *acme.Challenge) error {
+	// x/crypto/acme exposes DNS01ChallengeRecord(token) which returns the
+	// base64-of-sha256 value, NOT the full value to put in the TXT record.
+	// The TXT record value is the base64 itself.
+	txt, err := m.acmeCl.DNS01ChallengeRecord(chal.Token)
+	if err != nil {
+		return err
+	}
+	if err := m.dns.SetTXT(host, txt); err != nil {
+		return fmt.Errorf("provider SetTXT: %w", err)
+	}
+	m.logger.Info("dns-01: set TXT", "provider", m.dns.Name(), "host", host)
+	// Best-effort cleanup; ignore errors. A late delete is harmless.
+	defer func() {
+		if err := m.dns.DeleteTXT(host, txt); err != nil {
+			m.logger.Warn("dns-01: cleanup", "err", err)
+		}
+	}()
+	_ = ctx
 	return nil
 }
 

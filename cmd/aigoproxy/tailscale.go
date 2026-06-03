@@ -128,37 +128,25 @@ func needsRefresh(certFile string) bool {
 	return time.Since(info.ModTime()) > 60*24*time.Hour
 }
 
-// startHTTPS provisions a Tailscale cert and returns an *http.Server
-// configured to serve the same root mux over TLS on httpsAddr. The cert
-// is provisioned for the node's <node>.<tailnet>.ts.net.
-//
-// Note: the cert is a single cert + key; if a client SNI doesn't match
-// we serve it anyway (Go's default behaviour is to abort, but with one
-// cert, the SNI must match — for multi-host HTTPS a user would need to
-// add routes and we'd need to issue one cert per host, which is what
-// the Tailscale cert command does. For simplicity we serve the single
-// node cert and document the limitation.)
-func startHTTPS(ctx context.Context, logger *slog.Logger, httpsAddr string, root http.Handler, dataDir string) (*http.Server, error) {
-	info, err := tailscaleStatus(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("tailscale status: %w", err)
-	}
-	if info.DNSName == "" {
-		return nil, errors.New("no DNSName in tailscale status")
-	}
-	certFile, keyFile, err := ensureTailscaleCert(ctx, logger, info.DNSName, dataDir)
-	if err != nil {
-		return nil, fmt.Errorf("provision cert: %w", err)
-	}
+// newHTTPSServer builds an *http.Server bound to httpsAddr, serving root
+// over TLS using the cert and key at the given paths.
+func newHTTPSServer(httpsAddr string, root http.Handler, certFile, keyFile string) *http.Server {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
-		return nil, fmt.Errorf("load cert: %w", err)
+		// Fall back to an empty config — the serve loop will fail loudly
+		// and the operator can investigate. We don't crash because the
+		// HTTP-only path is still useful.
+		return &http.Server{
+			Addr:              httpsAddr,
+			Handler:           root,
+			ReadHeaderTimeout: 10 * time.Second,
+		}
 	}
 	tlsCfg := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS12,
 	}
-	srv := &http.Server{
+	return &http.Server{
 		Addr:              httpsAddr,
 		Handler:           root,
 		TLSConfig:         tlsCfg,
@@ -167,9 +155,4 @@ func startHTTPS(ctx context.Context, logger *slog.Logger, httpsAddr string, root
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
-	// Override ListenAndServeTLS by reading the cert paths in a wrapper.
-	// We use a custom listener.
-	_ = srv
-	logger.Info("https cert ready", "host", info.DNSName, "cert", certFile)
-	return srv, nil
 }
