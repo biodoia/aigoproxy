@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<title>{{ .Title }}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<link rel="stylesheet" href="/static/css/main.css">
+</head>
+<body>
+
+<header class="topbar">
+  <span class="brand">aigoproxy</span>
+  <nav>
+    <a href="/">Dashboard</a>
+    <a href="/routes">Routes</a>
+  </nav>
+  <span class="status">h24</span>
+</header>
+
+<main class="main">
+  <h1>Routes</h1>
+
+  <section class="form-card">
+    <h2>Add route</h2>
+    <form id="add-form" hx-post="/api/routes" hx-trigger="submit" hx-target="#routes-tbody" hx-swap="innerHTML">
+      <label>Host (e.g. grafana.biodoia.ts.net)
+        <input type="text" name="host" required>
+      </label>
+      <label>Upstream URL (e.g. http://192.168.1.50:3000)
+        <input type="text" name="upstream" required>
+      </label>
+      <label>Auth
+        <select name="auth">
+          <option value="none">none</option>
+          <option value="tailscale">tailscale</option>
+          <option value="funnel">funnel</option>
+        </select>
+      </label>
+      <label>Health check path (optional)
+        <input type="text" name="health" placeholder="/health">
+      </label>
+      <label>Strip prefix (optional)
+        <input type="text" name="strip_prefix" placeholder="/">
+      </label>
+      <button type="submit">Add</button>
+    </form>
+  </section>
+
+  <h2>Current routes</h2>
+  <table class="routes">
+    <thead>
+      <tr><th>Host</th><th>Upstream</th><th>Auth</th><th>Health</th><th>Status</th><th></th></tr>
+    </thead>
+    <tbody id="routes-tbody">
+      {{ range .Routes }}
+      <tr>
+        <td><code>{{ .Host }}</code></td>
+        <td><code>{{ .Upstream }}</code></td>
+        <td>{{ .Auth }}</td>
+        <td>{{ .Health }}</td>
+        <td>{{ if .Enabled }}<span class="ok">on</span>{{ else }}<span class="off">off</span>{{ end }}</td>
+        <td>
+          <button class="del" hx-delete="/api/routes?host={{ .Host }}" hx-confirm="Delete {{ .Host }}?">×</button>
+        </td>
+      </tr>
+      {{ else }}
+      <tr><td colspan="6" class="muted">No routes yet.</td></tr>
+      {{ end }}
+    </tbody>
+  </table>
+</main>
+
+<script src="/static/js/app.js" defer></script>
+</body>
+</html>

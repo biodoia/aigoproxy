@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<title>{{ .Title }}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<link rel="stylesheet" href="/static/css/main.css">
+</head>
+<body>
+
+<header class="topbar">
+  <span class="brand">aigoproxy</span>
+  <nav>
+    <a href="/">Dashboard</a>
+    <a href="/routes">Routes</a>
+  </nav>
+  <span class="status">h24</span>
+</header>
+
+<main class="main">
+  <h1>Dashboard</h1>
+
+  <section class="stats">
+    <div class="stat">
+      <span class="stat-label">Active routes</span>
+      <span class="stat-value">{{ .Stats.ActiveRoutes }}</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Total requests</span>
+      <span class="stat-value">{{ .Stats.TotalRequests }}</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Bytes proxied</span>
+      <span class="stat-value">{{ .Stats.BytesProxied }}</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Uptime</span>
+      <span class="stat-value">{{ .Stats.StartedAt.Format "15:04:05" }}</span>
+    </div>
+  </section>
+
+  <h2>Routes</h2>
+  <table class="routes">
+    <thead>
+      <tr>
+        <th>Host</th>
+        <th>Upstream</th>
+        <th>Auth</th>
+        <th>Status</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{ range .Routes }}
+      <tr>
+        <td><code>{{ .Host }}</code></td>
+        <td><code>{{ .Upstream }}</code></td>
+        <td>{{ .Auth }}</td>
+        <td>{{ if .Enabled }}<span class="ok">on</span>{{ else }}<span class="off">off</span>{{ end }}</td>
+      </tr>
+      {{ else }}
+      <tr><td colspan="4" class="muted">No routes configured. <a href="/routes">Add one</a>.</td></tr>
+      {{ end }}
+    </tbody>
+  </table>
+</main>
+
+<footer class="statusbar">
+  <span>aigoproxy · Tailscale-aware reverse proxy · Let's Encrypt ready</span>
+</footer>
+
+</body>
+</html>

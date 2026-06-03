@@ -1,0 +1,320 @@
+// Package proxy implements the HTTP/HTTPS reverse proxy core of aigoproxy.
+//
+// The proxy dispatches incoming requests to upstreams based on the Host
+// header. It is transport-agnostic: it works equally well on plain HTTP
+// (mode A: Tailscale Funnel) and on HTTPS (mode B: aigoproxy terminates
+// TLS via ACME-issued certs).
+//
+// Concurrency: Proxy holds a read-only snapshot of routes at Serve time
+// via Store. Re-issuing routes from the API requires calling Reload.
+package proxy
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/biodoia/aigoproxy/internal/config"
+	"github.com/biodoia/aigoproxy/internal/store"
+)
+
+// Proxy is the reverse proxy.
+type Proxy struct {
+	store  *store.Store
+	logger *slog.Logger
+	mu     sync.RWMutex
+	// routes is a cached map host → *httputil.ReverseProxy
+	routes map[string]*routeEntry
+	// healthStatus is a per-route atomic health flag (0 = down, 1 = up).
+	healthStatus sync.Map
+	// httpClient is shared for upstream requests (and health checks)
+	httpClient *http.Client
+}
+
+type routeEntry struct {
+	cfg   config.Route
+	proxy *httputil.ReverseProxy
+}
+
+// New returns a new Proxy.
+func New(s *store.Store, logger *slog.Logger) *Proxy {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	p := &Proxy{
+		store:  s,
+		logger: logger,
+		routes: make(map[string]*routeEntry),
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+	}
+	return p
+}
+
+// Reload rebuilds the internal route table from the store.
+func (p *Proxy) Reload() error {
+	cfg := p.store.Config()
+	entries := make(map[string]*routeEntry, len(cfg.Routes))
+	for _, r := range cfg.Routes {
+		if !r.Enabled {
+			continue
+		}
+		upstream, err := url.Parse(r.Upstream)
+		if err != nil {
+			p.logger.Error("skip route: bad upstream", "host", r.Host, "upstream", r.Upstream, "err", err)
+			continue
+		}
+		entry := &routeEntry{cfg: r}
+		entry.proxy = &httputil.ReverseProxy{
+			Director: p.makeDirector(r, upstream),
+			Transport: p.httpClient.Transport,
+			ErrorHandler: p.errorHandler(r),
+		}
+		entries[r.Host] = entry
+	}
+	p.mu.Lock()
+	p.routes = entries
+	p.mu.Unlock()
+	p.logger.Info("proxy: routes reloaded", "count", len(entries))
+	return nil
+}
+
+// makeDirector returns the director function for a route, configuring
+// scheme, host, and path rewriting.
+func (p *Proxy) makeDirector(r config.Route, upstream *url.URL) func(*http.Request) {
+	return func(req *http.Request) {
+		req.URL.Scheme = upstream.Scheme
+		req.URL.Host = upstream.Host
+		req.Host = upstream.Host // Important: don't leak the original Host header
+		// path prefix stripping
+		if r.StripPrefix != "" {
+			req.URL.Path = strings.TrimPrefix(req.URL.Path, r.StripPrefix)
+			if !strings.HasPrefix(req.URL.Path, "/") {
+				req.URL.Path = "/" + req.URL.Path
+			}
+		}
+		// mark request as proxied
+		req.Header.Set("X-Forwarded-Host", r.Host)
+		req.Header.Set("X-Forwarded-Proto", "https")
+		if existing := req.Header.Get("X-Forwarded-For"); existing != "" {
+			req.Header.Set("X-Forwarded-For", existing+", "+req.RemoteAddr)
+		} else {
+			req.Header.Set("X-Forwarded-For", req.RemoteAddr)
+		}
+	}
+}
+
+// errorHandler logs upstream failures and writes a 502 to the client.
+func (p *Proxy) errorHandler(r config.Route) func(http.ResponseWriter, *http.Request, error) {
+	return func(w http.ResponseWriter, req *http.Request, err error) {
+		p.logger.Warn("upstream error", "host", r.Host, "path", req.URL.Path, "err", err)
+		// mark route unhealthy
+		p.healthStatus.Store(r.Host, atomic.Bool{})
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.WriteString(w, fmt.Sprintf("upstream %s unreachable: %v\n", r.Upstream, err))
+	}
+}
+
+// ServeHTTP routes the request based on Host header.
+func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	host := stripPort(r.Host)
+	start := time.Now()
+
+	// Check health-status for known routes
+	entry := p.lookup(host)
+	if entry == nil {
+		// Unknown host — serve the dashboard
+		p.serveDashboard(w, r)
+		p.logAccess(host, r, http.StatusNotFound, 0, time.Since(start), "")
+		return
+	}
+
+	// Auth check
+	if !p.checkAuth(entry.cfg, r) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, "forbidden\n")
+		p.logAccess(host, r, http.StatusForbidden, 0, time.Since(start), "")
+		return
+	}
+
+	// Health probe
+	if entry.cfg.Health != "" && r.URL.Path == entry.cfg.Health {
+		w.Header().Set("Content-Type", "application/json")
+		if p.isHealthy(host) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"status":"ok"}`)
+		} else {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, `{"status":"unhealthy"}`)
+		}
+		return
+	}
+
+	// Capture status code for logging
+	rw := &statusRecorder{ResponseWriter: w, status: 200}
+	entry.proxy.ServeHTTP(rw, r)
+
+	dur := time.Since(start)
+	p.logAccess(host, r, rw.status, rw.bytes, dur, r.Header.Get("Tailscale-User"))
+}
+
+func (p *Proxy) lookup(host string) *routeEntry {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.routes[host]
+}
+
+// isHealthy returns the cached health status (defaults to true if no probe yet).
+func (p *Proxy) isHealthy(host string) bool {
+	v, ok := p.healthStatus.Load(host)
+	if !ok {
+		return true // no data yet
+	}
+	b := v.(*atomic.Bool)
+	return b.Load()
+}
+
+// checkAuth returns true if the request is allowed by the route's auth setting.
+func (p *Proxy) checkAuth(r config.Route, req *http.Request) bool {
+	switch r.Auth {
+	case "none", "":
+		return true
+	case "tailscale":
+		// Tailscale injects these headers when the request is from a tailnet device
+		return req.Header.Get("Tailscale-User") != "" || req.Header.Get("X-Forwarded-For-Tailscale") != ""
+	case "funnel":
+		// Funnel is allowed; Tailscale Funnel proxies to localhost and may not
+		// set Tailscale-User. We trust the network path here.
+		return true
+	}
+	return false
+}
+
+// serveDashboard shows a minimal HTML page listing the routes, useful
+// for the "I navigated to the wrong host" case.
+func (p *Proxy) serveDashboard(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusNotFound)
+	_, _ = fmt.Fprintf(w, "aigoproxy\nno route for host %q\n\nregistered hosts:\n", r.Host)
+	for _, route := range p.store.Config().Routes {
+		if route.Enabled {
+			_, _ = fmt.Fprintf(w, "  %s → %s\n", route.Host, route.Upstream)
+		}
+	}
+}
+
+// logAccess is a small helper that wraps store.LogAccess.
+func (p *Proxy) logAccess(host string, r *http.Request, status int, bytes int64, dur time.Duration, user string) {
+	p.store.LogAccess(store.AccessLogEntry{
+		Time:      time.Now(),
+		Host:      host,
+		Method:    r.Method,
+		Path:      r.URL.Path,
+		Status:    status,
+		Bytes:     bytes,
+		LatencyMs: dur.Milliseconds(),
+		Remote:    clientIP(r),
+		User:      user,
+	})
+}
+
+func clientIP(r *http.Request) string {
+	if h := r.Header.Get("X-Forwarded-For"); h != "" {
+		// first hop
+		if i := strings.Index(h, ","); i > 0 {
+			return strings.TrimSpace(h[:i])
+		}
+		return strings.TrimSpace(h)
+	}
+	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+	return host
+}
+
+func stripPort(h string) string {
+	if i := strings.IndexByte(h, ':'); i > 0 {
+		return h[:i]
+	}
+	return h
+}
+
+// statusRecorder wraps ResponseWriter to capture status + bytes.
+type statusRecorder struct {
+	http.ResponseWriter
+	status      int
+	bytes       int64
+	wroteHeader bool
+}
+
+func (s *statusRecorder) WriteHeader(c int) {
+	if !s.wroteHeader {
+		s.status = c
+		s.wroteHeader = true
+	}
+	s.ResponseWriter.WriteHeader(c)
+}
+
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	if !s.wroteHeader {
+		s.wroteHeader = true
+	}
+	n, err := s.ResponseWriter.Write(b)
+	s.bytes += int64(n)
+	return n, err
+}
+
+// Flush forwards to underlying writer for streaming responses.
+func (s *statusRecorder) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// HealthCheckLoop runs periodic health probes for all routes in the background.
+func (p *Proxy) HealthCheckLoop(ctx context.Context) {
+	tick := time.NewTicker(30 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			p.probeAll()
+		}
+	}
+}
+
+func (p *Proxy) probeAll() {
+	cfg := p.store.Config()
+	for _, r := range cfg.Routes {
+		if !r.Enabled || r.Health == "" {
+			continue
+		}
+		go p.probe(r)
+	}
+}
+
+func (p *Proxy) probe(r config.Route) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	url := strings.TrimRight(r.Upstream, "/") + r.Health
+	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	resp, err := p.httpClient.Do(req)
+	healthy := err == nil && resp != nil && resp.StatusCode < 500
+	if resp != nil {
+		resp.Body.Close()
+	}
+	v, _ := p.healthStatus.LoadOrStore(r.Host, &atomic.Bool{})
+	v.(*atomic.Bool).Store(healthy)
+}
