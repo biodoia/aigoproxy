@@ -36,6 +36,7 @@ import (
 	"github.com/biodoia/aigoproxy/internal/config"
 	"github.com/biodoia/aigoproxy/internal/mcpserver"
 	"github.com/biodoia/aigoproxy/internal/proxy"
+	"github.com/biodoia/aigoproxy/internal/screenshot"
 	"github.com/biodoia/aigoproxy/internal/store"
 	"github.com/biodoia/aigoproxy/internal/tui"
 	"github.com/biodoia/aigoproxy/internal/webui"
@@ -124,13 +125,67 @@ func main() {
 	// renewal loop started after ctx is created (see below)
 
 	// 5. Servers
-	webuiSrv, err := webui.New(*addr, s, logger)
+	// Screenshot manager captures PNG previews of route upstreams. The
+	// directory lives under dataDir so the systemd unit's ReadWritePaths
+	// already covers it.
+	ssDir := filepath.Join(*dataDir, "screenshots")
+	ss := screenshot.New(screenshot.Config{
+		Dir:      ssDir,
+		Interval: 5 * time.Minute,
+		Timeout:  30 * time.Second,
+		Logger:   logger,
+	})
+	// Wire HostsFn and URLFn so the screenshot manager knows what to capture.
+	// For tailnet-internal access, the URL is http://<host> from the
+	// local network. For Tailscale Funnel, we use https://<node>.<tailnet>/<path>.
+	ss.HostsFn = func() []string {
+		out := []string{}
+		for _, r := range s.Config().Routes {
+			if r.Enabled {
+				out = append(out, r.Host)
+			}
+		}
+		return out
+	}
+	ss.URLFn = func(host string) string {
+		// Try the local upstream first (no Tailscale cert needed for
+		// localhost). If the upstream is reachable we capture it; if
+		// not, chrome will just produce a "connection refused" image
+		// which is also useful for status debugging.
+		for _, r := range s.Config().Routes {
+			if r.Host == host {
+				return r.Upstream
+			}
+		}
+		return "http://localhost"
+	}
+
+	webuiSrv, err := webui.New(*addr, s, px, ss, cfg.BaseDomain, logger)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "webui: %v\n", err)
 		os.Exit(1)
 	}
 	mcpSrv := mcpserver.New(s, logger)
 	acpSrv := acpserver.New(s, logger)
+	// Wire MCP server callbacks to webui so MCP tools can drive the full
+	// agentic flow: scan → inspect → register → reload → screenshot.
+	mcpSrv.SetOnRouteChanged(func() {
+		_ = px.Reload()
+		if ss != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			for _, r := range s.Config().Routes {
+				_ = ss.Capture(ctx, r.Host)
+			}
+		}
+	})
+	mcpSrv.SetScan(func() []any {
+		out := []any{}
+		for _, sg := range webuiSrv.Suggestions() {
+			out = append(out, sg)
+		}
+		return out
+	})
 
 	// 6. Compose HTTP
 	root := http.NewServeMux()
@@ -147,6 +202,7 @@ func main() {
 	defer cancel()
 	go px.HealthCheckLoop(ctx)
 	go acm.RenewalLoop(ctx)
+	go ss.Loop(ctx)
 
 	// 8. TUI (optional)
 	if *enableTUI {
@@ -264,6 +320,12 @@ func combinedHandler(px *proxy.Proxy, webuiSrv *webui.Server, acm *acme.Manager,
 		// ACME HTTP-01 challenge path: serve from in-memory token store
 		if strings.HasPrefix(r.URL.Path, "/.well-known/acme-challenge/") {
 			acm.ChallengeHandler().ServeHTTP(w, r)
+			return
+		}
+		// Screenshots: served by the webui regardless of host (the
+		// screenshot files live in our data dir).
+		if strings.HasPrefix(r.URL.Path, "/screenshots/") {
+			webuiSrv.Handler().ServeHTTP(w, r)
 			return
 		}
 		// Dashboard + API: served when Host is the node's own FQDN (or

@@ -6,16 +6,18 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
 <link rel="stylesheet" href="/static/css/main.css">
+<meta http-equiv="refresh" content="30">
 </head>
 <body>
 
 <header class="topbar">
   <span class="brand">aigoproxy</span>
   <nav>
-    <a href="/">Dashboard</a>
+    <a href="/" class="active">Dashboard</a>
     <a href="/routes">Routes</a>
+    <a href="/api/stats">Stats</a>
   </nav>
-  <span class="status">h24</span>
+  <span class="status">● live</span>
 </header>
 
 <main class="main">
@@ -35,39 +37,103 @@
       <span class="stat-value">{{ .Stats.BytesProxied }}</span>
     </div>
     <div class="stat">
+      <span class="stat-label">Active conns</span>
+      <span class="stat-value" id="active-conns">0</span>
+    </div>
+    <div class="stat">
       <span class="stat-label">Uptime</span>
       <span class="stat-value">{{ .Stats.StartedAt.Format "15:04:05" }}</span>
     </div>
   </section>
 
-  <h2>Routes</h2>
-  <table class="routes">
-    <thead>
-      <tr>
-        <th>Host</th>
-        <th>Upstream</th>
-        <th>Auth</th>
-        <th>Status</th>
-      </tr>
-    </thead>
-    <tbody>
-      {{ range .Routes }}
-      <tr>
-        <td><code>{{ .Host }}</code></td>
-        <td><code>{{ .Upstream }}</code></td>
-        <td>{{ .Auth }}</td>
-        <td>{{ if .Enabled }}<span class="ok">on</span>{{ else }}<span class="off">off</span>{{ end }}</td>
-      </tr>
-      {{ else }}
-      <tr><td colspan="4" class="muted">No routes configured. <a href="/routes">Add one</a>.</td></tr>
-      {{ end }}
-    </tbody>
-  </table>
+  <div class="dashboard-toolbar">
+    <h2>Routes</h2>
+    <div class="actions">
+      <button onclick="captureAll()" class="btn">📸 Re-capture all screenshots</button>
+      <button onclick="rescan()" class="btn">🔍 Rescan local ports</button>
+    </div>
+  </div>
+
+  <div class="route-grid">
+    {{ range .Routes }}
+    <article class="route-card status-{{ if .Healthy }}ok{{ else }}down{{ end }}" data-host="{{ .Host }}">
+      <div class="card-header">
+        <a class="card-title" href="https://{{ .Host }}" target="_blank" rel="noopener">{{ .Host }}</a>
+        <span class="card-status {{ if .Healthy }}ok{{ else }}down{{ end }}">{{ if .Healthy }}● online{{ else }}● offline{{ end }}</span>
+      </div>
+      <div class="card-screenshot" data-host="{{ .Host }}">
+        {{ if .ScreenshotReady }}
+        <a href="https://{{ .Host }}" target="_blank" rel="noopener">
+          <img src="/screenshots/{{ .Host }}.png?t={{ $.Now.Unix }}" alt="{{ .Host }} preview" loading="lazy" onerror="this.parentNode.parentNode.classList.add('img-error'); this.style.display='none';">
+        </a>
+        {{ else }}
+        <div class="screenshot-placeholder">
+          <span class="placeholder-icon">📷</span>
+          <span class="placeholder-text">no screenshot yet</span>
+        </div>
+        {{ end }}
+      </div>
+      <div class="card-body">
+        <dl class="kv">
+          <dt>Upstream</dt><dd><code>{{ .Upstream }}</code></dd>
+          {{ if .PathPrefix }}<dt>Path</dt><dd><code>{{ .PathPrefix }}</code></dd>{{ end }}
+          <dt>Auth</dt><dd><span class="auth auth-{{ .Auth }}">{{ .Auth }}</span></dd>
+          <dt>Status</dt><dd>
+            <span class="status-code status-{{ .LastStatusClass }}">{{ .LastStatus }}</span>
+          </dd>
+        </dl>
+        <div class="card-stats">
+          <div class="mini-stat"><span class="ms-label">reqs</span><span class="ms-value">{{ .TotalReqs }}</span></div>
+          <div class="mini-stat"><span class="ms-label">bytes</span><span class="ms-value">{{ .TotalBytesHuman }}</span></div>
+          <div class="mini-stat"><span class="ms-label">active</span><span class="ms-value">{{ .ActiveConns }}</span></div>
+          <div class="mini-stat"><span class="ms-label">latency</span><span class="ms-value">{{ .LastLatency }}ms</span></div>
+        </div>
+        <div class="card-footer">
+          <span class="last-seen" data-lastreq="{{ .LastRequestUnix }}">last: {{ .LastSeen }}</span>
+          <div class="card-actions">
+            <button onclick="recapture('{{ .Host }}')" title="Re-capture screenshot" class="btn-mini">📸</button>
+            <button onclick="copyUrl('{{ .Host }}')" title="Copy URL" class="btn-mini">🔗</button>
+            <button onclick="removeRoute('{{ .Host }}')" title="Remove route" class="btn-mini danger">✕</button>
+          </div>
+        </div>
+      </div>
+    </article>
+    {{ else }}
+    <article class="route-card empty">
+      <div class="empty-state">
+        <h3>No routes configured</h3>
+        <p>Add your first route to expose a local service.</p>
+        <a href="/routes" class="btn">+ Add route</a>
+      </div>
+    </article>
+    {{ end }}
+  </div>
+
+  {{ if .Suggestions }}
+  <section class="suggestions">
+    <h2>🔍 Detected services on this machine</h2>
+    <p class="muted">Click <em>Register</em> to add a route. The system will configure Tailscale Funnel + screenshot capture automatically.</p>
+    <table class="suggestions-table">
+      <thead><tr><th>Port</th><th>Name guess</th><th>First byte</th><th></th></tr></thead>
+      <tbody>
+        {{ range .Suggestions }}
+        <tr>
+          <td><code>:{{ .Port }}</code></td>
+          <td><code>{{ .TitleGuess }}</code></td>
+          <td><code>{{ .FirstByte }}</code></td>
+          <td><button onclick="register({{ .Port }}, '{{ .TitleGuess }}')" class="btn">Register</button></td>
+        </tr>
+        {{ end }}
+      </tbody>
+    </table>
+  </section>
+  {{ end }}
 </main>
 
 <footer class="statusbar">
-  <span>aigoproxy · Tailscale-aware reverse proxy · Let's Encrypt ready</span>
+  <span>aigoproxy · Tailscale-aware reverse proxy · {{ .Now.Format "2006-01-02 15:04:05" }}</span>
 </footer>
 
+<script src="/static/js/app.js"></script>
 </body>
 </html>

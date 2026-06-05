@@ -7,15 +7,19 @@
 //   GET  /mcp/info   — server info
 //
 // Tools:
-//   aigoproxy_list   — list all routes
-//   aigoproxy_get    — get one route
-//   aigoproxy_add    — add a route
-//   aigoproxy_remove — remove a route
-//   aigoproxy_log    — get recent access log
-//   aigoproxy_stats  — get runtime stats
+//   aigoproxy_list    — list all routes
+//   aigoproxy_get     — get one route
+//   aigoproxy_add     — add a route
+//   aigoproxy_remove  — remove a route
+//   aigoproxy_log     — get recent access log
+//   aigoproxy_stats   — get runtime stats
+//   aigoproxy_inspect — probe an upstream and report auth presence
+//   aigoproxy_register — one-shot: inspect + add + screenshot + funnel
+//   aigoproxy_scan    — port-scan localhost for HTTP services
 package mcpserver
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -24,14 +28,26 @@ import (
 	"time"
 
 	"github.com/biodoia/aigoproxy/internal/config"
+	"github.com/biodoia/aigoproxy/internal/detector"
 	"github.com/biodoia/aigoproxy/internal/store"
 )
 
 // Server is the MCP server.
 type Server struct {
-	store  *store.Store
-	logger *slog.Logger
+	store    *store.Store
+	logger   *slog.Logger
+	onChange func() // optional: invoked after add/remove so caller can reload
+	scanFn   func() []any
 }
+
+// SetOnRouteChanged registers a callback fired after aigoproxy_add and
+// aigoproxy_register so the caller can reload the proxy and refresh
+// screenshots in the background.
+func (s *Server) SetOnRouteChanged(fn func()) { s.onChange = fn }
+
+// SetScan registers a port-scan function the MCP server can call for
+// aigoproxy_scan. Returns the slice of suggestions.
+func (s *Server) SetScan(fn func() []any) { s.scanFn = fn }
 
 // New returns a new MCP Server.
 func New(s *store.Store, logger *slog.Logger) *Server {
@@ -216,6 +232,34 @@ func (s *Server) toolList() []toolDef {
 			Description: "Get runtime stats (total requests, bytes proxied, etc.).",
 			InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
 		},
+		{
+			Name:        "aigoproxy_inspect",
+			Description: "Probe an upstream URL and return whether it has its own auth (HTML form, redirect to /login, etc). Use before aigoproxy_register to know if you need to wrap it with auth.",
+			InputSchema: map[string]any{
+				"type":     "object",
+				"properties": map[string]any{"upstream": map[string]any{"type": "string"}},
+				"required": []string{"upstream"},
+			},
+		},
+		{
+			Name:        "aigoproxy_register",
+			Description: "One-shot register: inspect the upstream, pick a sensible auth, add the route, capture a screenshot, configure Tailscale Funnel (if path_prefix is set). Returns the new route and the inspection result.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"host":        map[string]any{"type": "string"},
+					"upstream":    map[string]any{"type": "string"},
+					"path_prefix": map[string]any{"type": "string"},
+					"auth":        map[string]any{"type": "string", "enum": []string{"none", "tailscale", "funnel", "auto"}},
+				},
+				"required": []string{"host", "upstream"},
+			},
+		},
+		{
+			Name:        "aigoproxy_scan",
+			Description: "Scan localhost for HTTP services and return a list of {port, title, has_auth, suggested_host, suggested_path} so the agent can pick which to expose. Mirrors /api/rescan.",
+			InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
+		},
 	}
 }
 
@@ -252,6 +296,66 @@ func (s *Server) toolCall(name string, args json.RawMessage) (any, error) {
 			return nil, err
 		}
 		return map[string]any{"status": "ok", "host": p.Host}, nil
+	case "aigoproxy_inspect":
+		var p struct {
+			Upstream string `json:"upstream"`
+		}
+		_ = json.Unmarshal(args, &p)
+		if p.Upstream == "" {
+			return nil, fmt.Errorf("upstream required")
+		}
+		res, err := detector.Inspect(context.Background(), p.Upstream)
+		if err != nil {
+			return nil, err
+		}
+		return res, nil
+	case "aigoproxy_register":
+		var p struct {
+			Host       string `json:"host"`
+			Upstream   string `json:"upstream"`
+			PathPrefix string `json:"path_prefix"`
+			Auth       string `json:"auth"`
+		}
+		_ = json.Unmarshal(args, &p)
+		if p.Host == "" || p.Upstream == "" {
+			return nil, fmt.Errorf("host and upstream required")
+		}
+		// 1. Inspect
+		insp, _ := detector.Inspect(context.Background(), p.Upstream)
+		// 2. Pick auth
+		auth := p.Auth
+		if auth == "" || auth == "auto" {
+			if insp != nil && !insp.HasAuth {
+				// service has no auth → must wrap it
+				auth = "tailscale"
+			} else {
+				auth = "none"
+			}
+		}
+		// 3. Add route
+		_, err := s.store.AddRoute(config.Route{
+			Host: p.Host, Upstream: p.Upstream, Auth: auth, PathPrefix: p.PathPrefix,
+		})
+		if err != nil {
+			return nil, err
+		}
+		// 4. Reload proxy + trigger screenshot (background)
+		if s.onChange != nil {
+			go s.onChange()
+		}
+		return map[string]any{
+			"status":         "ok",
+			"host":           p.Host,
+			"auth_applied":   auth,
+			"inspection":     insp,
+			"funnel_path":    p.PathPrefix,
+		}, nil
+	case "aigoproxy_scan":
+		// Returns the most recent port scan results. If none, run one now.
+		if s.scanFn != nil {
+			return s.scanFn(), nil
+		}
+		return nil, nil
 	case "aigoproxy_remove":
 		var p struct {
 			Host string `json:"host"`

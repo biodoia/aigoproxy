@@ -38,6 +38,78 @@ type Proxy struct {
 	healthStatus sync.Map
 	// httpClient is shared for upstream requests (and health checks)
 	httpClient *http.Client
+	// routeStats is host → per-route runtime counters (active conns, total
+	// requests, total bytes, last status, last request time).
+	routeStats sync.Map
+}
+
+// RouteStats is the runtime stats surface for a single route.
+type RouteStats struct {
+	ActiveConns  int64     `json:"active_conns"`
+	TotalReqs    int64     `json:"total_requests"`
+	TotalBytes   int64     `json:"total_bytes"`
+	LastStatus   int       `json:"last_status"`
+	LastRequest  time.Time `json:"last_request"`
+	LastLatency  int64     `json:"last_latency_ms"`
+	FirstRequest time.Time `json:"first_request,omitempty"`
+}
+
+// GetStats returns a snapshot of stats for host.
+func (p *Proxy) GetStats(host string) RouteStats {
+	v, ok := p.routeStats.Load(host)
+	if !ok {
+		return RouteStats{}
+	}
+	s := v.(*atomicRouteStats)
+	return s.snapshot()
+}
+
+// AllStats returns stats for every route currently registered.
+func (p *Proxy) AllStats() map[string]RouteStats {
+	out := map[string]RouteStats{}
+	p.routeStats.Range(func(k, v any) bool {
+		out[k.(string)] = v.(*atomicRouteStats).snapshot()
+		return true
+	})
+	return out
+}
+
+// atomicRouteStats is a small struct of atomics for hot-path counters.
+type atomicRouteStats struct {
+	activeConns atomic.Int64
+	totalReqs   atomic.Int64
+	totalBytes  atomic.Int64
+	lastStatus  atomic.Int64 // int for CAS-free store
+	lastReqUnix atomic.Int64
+	lastLatency atomic.Int64
+	firstReq    atomic.Int64
+}
+
+func (s *atomicRouteStats) snapshot() RouteStats {
+	lr := s.lastReqUnix.Load()
+	fr := s.firstReq.Load()
+	r := RouteStats{
+		ActiveConns: s.activeConns.Load(),
+		TotalReqs:   s.totalReqs.Load(),
+		TotalBytes:  s.totalBytes.Load(),
+		LastStatus:  int(s.lastStatus.Load()),
+		LastLatency: s.lastLatency.Load(),
+	}
+	if lr > 0 {
+		r.LastRequest = time.Unix(0, lr)
+	}
+	if fr > 0 {
+		r.FirstRequest = time.Unix(0, fr)
+	}
+	return r
+}
+
+func (p *Proxy) statsFor(host string) *atomicRouteStats {
+	if v, ok := p.routeStats.Load(host); ok {
+		return v.(*atomicRouteStats)
+	}
+	v, _ := p.routeStats.LoadOrStore(host, &atomicRouteStats{})
+	return v.(*atomicRouteStats)
 }
 
 type routeEntry struct {
@@ -139,6 +211,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.logAccess(host, r, http.StatusNotFound, 0, time.Since(start), "")
 		return
 	}
+	// Track this connection
+	stats := p.statsFor(entry.cfg.Host)
+	stats.activeConns.Add(1)
+	stats.totalReqs.Add(1)
+	if stats.firstReq.Load() == 0 {
+		stats.firstReq.Store(time.Now().UnixNano())
+	}
+	defer stats.activeConns.Add(-1)
 
 	// Auth check
 	if !p.checkAuth(entry.cfg, r) {
@@ -146,6 +226,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = io.WriteString(w, "forbidden\n")
 		p.logAccess(host, r, http.StatusForbidden, 0, time.Since(start), "")
+		stats.lastStatus.Store(int64(http.StatusForbidden))
+		stats.lastReqUnix.Store(time.Now().UnixNano())
+		stats.lastLatency.Store(time.Since(start).Milliseconds())
 		return
 	}
 
@@ -168,6 +251,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	dur := time.Since(start)
 	p.logAccess(host, r, rw.status, rw.bytes, dur, r.Header.Get("Tailscale-User"))
+	// Update per-route stats
+	stats.lastStatus.Store(int64(rw.status))
+	stats.totalBytes.Add(rw.bytes)
+	stats.lastReqUnix.Store(time.Now().UnixNano())
+	stats.lastLatency.Store(dur.Milliseconds())
 }
 
 // lookup finds a route for the given host. If a path prefix is given
