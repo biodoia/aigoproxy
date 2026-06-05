@@ -1,10 +1,15 @@
-# aigoproxy.service — systemd user unit
+# aigoproxy.service — systemd unit (system mode, runs as aigoproxy user)
 #
-# Install: see ../install.sh
-# Status:  systemctl --user status aigoproxy
-# Logs:    journalctl --user -u aigoproxy -f
-# Reload:  systemctl --user reload aigoproxy   # sends SIGHUP
-# Stop:    systemctl --user stop aigoproxy
+# Why system mode: user-mode systemd can't grant CAP_NET_BIND_SERVICE
+# (needed for :80, :443) without CAP_SETFCAP, which most distros don't
+# grant to the install user. System mode + dedicated user is the
+# standard production pattern for a public reverse proxy.
+#
+# Install: see ../install.sh (creates user + dirs + setcap on the binary)
+# Status:  systemctl status aigoproxy
+# Logs:    journalctl -u aigoproxy -f
+# Reload:  systemctl reload aigoproxy          # sends SIGHUP
+# Stop:    systemctl stop aigoproxy
 
 [Unit]
 Description=aigoproxy — Tailscale-aware reverse proxy
@@ -13,14 +18,15 @@ After=network-online.target tailscaled.service
 Wants=network-online.target
 
 [Service]
-Type=notify
-ExecStart=/usr/local/bin/aigoproxy -addr :80 -config %h/.aigoproxy/config.yaml -data %h/.aigoproxy
-# Tailscale Funnel: bind on :80 then turn on funnel for that port.
-# `tailscale funnel 80 on` is one-shot and persists, but we run it on every
-# start in case the user wiped state.
-ExecStartPost=/usr/bin/tailscale funnel 80 on
-# When the user re-installs or moves the binary, this reload triggers a
-# graceful config reload (SIGHUP).
+Type=simple
+User=aigoproxy
+Group=aigoproxy
+# When run as the aigoproxy user, we use setcap to bind :80.
+# setcap is set by install.sh; if it's missing, bind to a high port
+# with `-addr :8080`.
+ExecStart=/usr/local/bin/aigoproxy -addr :80 -config /etc/aigoproxy/config.yaml -data /var/lib/aigoproxy
+# Graceful config reload: sends SIGHUP, which aigoproxy handles by
+# re-reading config.yaml and rebuilding the route table.
 ExecReload=/bin/kill -HUP $MAINPID
 # Stop gracefully — give the HTTP server 10s to drain in-flight requests.
 TimeoutStopSec=10s
@@ -28,10 +34,15 @@ KillMode=mixed
 Restart=on-failure
 RestartSec=5s
 
-# Hardening
-NoNewPrivileges=true
+# Hardening. We do NOT set NoNewPrivileges=true because the binary uses
+# file capabilities (setcap cap_net_bind_service) to bind :80. File
+# capabilities act like a setuid bit, which NoNewPrivileges blocks.
+# Instead, we use AmbientCapabilities to grant the cap directly to the
+# process and to its children, without needing root.
 ProtectSystem=strict
-ProtectHome=read-only
+ProtectHome=true
+ReadWritePaths=/var/lib/aigoproxy /var/lib/tailscale /home/%i/.local/share/tailscale
+ReadOnlyPaths=/etc/aigoproxy
 PrivateTmp=true
 PrivateDevices=true
 ProtectKernelTunables=true
@@ -40,12 +51,15 @@ ProtectControlGroups=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 RestrictNamespaces=true
 LockPersonality=true
-MemoryDenyWriteExecute=true
 
-# We bind :80 which is a privileged port. AmbientCapabilities is the
-# modern way without root.
+# Grant CAP_NET_BIND_SERVICE so the process can bind :80 and :443
+# without running as root. This works alongside the setcap applied
+# to the binary at install time.
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# We bind :80 which is a privileged port. setcap is applied at install
+# time (see install.sh), so we don't need root or AmbientCapabilities.
 
 # Logging
 StandardOutput=journal
@@ -53,4 +67,4 @@ StandardError=journal
 SyslogIdentifier=aigoproxy
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

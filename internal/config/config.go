@@ -77,6 +77,11 @@ type Route struct {
 	// StripPrefix removes a path prefix from incoming requests before
 	// forwarding to upstream. Useful for "/grafana/" → "/" upstream.
 	StripPrefix string `yaml:"strip_prefix"`
+	// PathPrefix makes this route match incoming requests whose URL path
+	// starts with this prefix, even when the Host header doesn't match.
+	// This is the recommended pattern for services behind a Tailscale
+	// Funnel listener (one :443, many services distinguished by path).
+	PathPrefix string `yaml:"path_prefix"`
 	// Enabled can be set to false to take a route offline temporarily
 	// without deleting it.
 	Enabled bool `yaml:"enabled"`

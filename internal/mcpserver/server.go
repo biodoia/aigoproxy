@@ -242,11 +242,12 @@ func (s *Server) toolCall(name string, args json.RawMessage) (any, error) {
 			Auth        string `json:"auth"`
 			Health      string `json:"health"`
 			StripPrefix string `json:"strip_prefix"`
-		}
-		_ = json.Unmarshal(args, &p)
-		_, err := s.store.AddRoute(config.Route{
-			Host: p.Host, Upstream: p.Upstream, Auth: p.Auth, Health: p.Health, StripPrefix: p.StripPrefix,
-		})
+			PathPrefix  string `json:"path_prefix"`
+			}
+			_ = json.Unmarshal(args, &p)
+			_, err := s.store.AddRoute(config.Route{
+			Host: p.Host, Upstream: p.Upstream, Auth: p.Auth, Health: p.Health, StripPrefix: p.StripPrefix, PathPrefix: p.PathPrefix,
+			})
 		if err != nil {
 			return nil, err
 		}

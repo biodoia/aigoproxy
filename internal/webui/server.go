@@ -120,13 +120,14 @@ func (s *Server) handleAPIRoutes(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		_ = json.NewEncoder(w).Encode(s.store.Config().Routes)
 	case http.MethodPost:
-		// body: {host, upstream, auth, health, strip_prefix}
+		// body: {host, upstream, auth, health, strip_prefix, path_prefix}
 		var body struct {
 			Host        string `json:"host"`
 			Upstream    string `json:"upstream"`
 			Auth        string `json:"auth"`
 			Health      string `json:"health"`
 			StripPrefix string `json:"strip_prefix"`
+			PathPrefix  string `json:"path_prefix"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -138,6 +139,7 @@ func (s *Server) handleAPIRoutes(w http.ResponseWriter, r *http.Request) {
 			Health:      body.Health,
 			Auth:        body.Auth,
 			StripPrefix: body.StripPrefix,
+			PathPrefix:  body.PathPrefix,
 		})
 		_ = idx
 		if err != nil {

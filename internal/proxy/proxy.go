@@ -132,7 +132,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
 	// Check health-status for known routes
-	entry := p.lookup(host)
+	entry := p.lookup(host, r.URL.Path)
 	if entry == nil {
 		// Unknown host — serve the dashboard
 		p.serveDashboard(w, r)
@@ -170,10 +170,37 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.logAccess(host, r, rw.status, rw.bytes, dur, r.Header.Get("Tailscale-User"))
 }
 
-func (p *Proxy) lookup(host string) *routeEntry {
+// lookup finds a route for the given host. If a path prefix is given
+// (for routes registered behind a Tailscale Funnel set-path), it tries
+// the longest matching path first. Falls back to exact host match.
+func (p *Proxy) lookup(host, path string) *routeEntry {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.routes[host]
+	// 1. exact host match (works for tailnet-internal access)
+	if e, ok := p.routes[host]; ok {
+		return e
+	}
+	// 2. path-based routing (for Tailscale Funnel: all services behind
+	//    a single :443, distinguished by URL path prefix)
+	if path != "" {
+		var bestMatch string
+		var bestEntry *routeEntry
+		for _, e := range p.routes {
+			if e.cfg.PathPrefix == "" {
+				continue
+			}
+			if strings.HasPrefix(path, e.cfg.PathPrefix) {
+				if len(e.cfg.PathPrefix) > len(bestMatch) {
+					bestMatch = e.cfg.PathPrefix
+					bestEntry = e
+				}
+			}
+		}
+		if bestEntry != nil {
+			return bestEntry
+		}
+	}
+	return nil
 }
 
 // isHealthy returns the cached health status (defaults to true if no probe yet).

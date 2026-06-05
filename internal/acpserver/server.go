@@ -147,11 +147,11 @@ func (s *Server) dispatch(ctx contextLike, req *struct {
 		resp["error"] = map[string]any{"code": -32603, "message": "not found"}
 	case "add_route":
 		var p struct {
-			Host, Upstream, Health, Auth, StripPrefix string
+			Host, Upstream, Health, Auth, StripPrefix, PathPrefix string
 		}
 		_ = json.Unmarshal(req.Params, &p)
 		_, err := s.store.AddRoute(config.Route{
-			Host: p.Host, Upstream: p.Upstream, Health: p.Health, Auth: p.Auth, StripPrefix: p.StripPrefix,
+			Host: p.Host, Upstream: p.Upstream, Health: p.Health, Auth: p.Auth, StripPrefix: p.StripPrefix, PathPrefix: p.PathPrefix,
 		})
 		if err != nil {
 			resp["error"] = map[string]any{"code": -32603, "message": err.Error()}
@@ -187,15 +187,15 @@ func (s *Server) dispatch(ctx contextLike, req *struct {
 	return resp
 }
 
-func routeFromArgs(p struct{ Host, Upstream, Health, Auth, StripPrefix string }) routeAddArgs {
+func routeFromArgs(p struct{ Host, Upstream, Health, Auth, StripPrefix, PathPrefix string }) routeAddArgs {
 	return routeAddArgs{
-		Host: p.Host, Upstream: p.Upstream, Health: p.Health, Auth: p.Auth, StripPrefix: p.StripPrefix,
+		Host: p.Host, Upstream: p.Upstream, Health: p.Health, Auth: p.Auth, StripPrefix: p.StripPrefix, PathPrefix: p.PathPrefix,
 	}
 }
 
 // routeAddArgs is a thin alias to keep dispatch readable.
 type routeAddArgs = struct {
-	Host, Upstream, Health, Auth, StripPrefix string
+	Host, Upstream, Health, Auth, StripPrefix, PathPrefix string
 }
 
 // _ ensures routeAddArgs stays available for future use even though the
