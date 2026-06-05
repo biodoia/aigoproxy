@@ -35,6 +35,7 @@ import (
 	"github.com/biodoia/aigoproxy/internal/acpserver"
 	"github.com/biodoia/aigoproxy/internal/config"
 	"github.com/biodoia/aigoproxy/internal/mcpserver"
+	"github.com/biodoia/aigoproxy/internal/ports"
 	"github.com/biodoia/aigoproxy/internal/proxy"
 	"github.com/biodoia/aigoproxy/internal/screenshot"
 	"github.com/biodoia/aigoproxy/internal/store"
@@ -90,6 +91,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "store: %v\n", err)
 		os.Exit(1)
 	}
+	// 1b. Port allocator — Memogo-backed, namespace "aigoproxy:ports".
+	// Wired into MCP tools (aigoproxy_ports_*) and into the dashboard
+	// /ports page. Independent of the route store: a port can be
+	// reserved without a corresponding route, and a route can exist
+	// without a port reservation (e.g. for a service bound before
+	// the allocator was deployed).
+	portAlloc := ports.New(s.API())
 	// 2. Config
 	if _, err := s.LoadConfig(); err != nil {
 		fmt.Fprintf(os.Stderr, "config: %v\n", err)
@@ -160,12 +168,12 @@ func main() {
 		return "http://localhost"
 	}
 
-	webuiSrv, err := webui.New(*addr, s, px, ss, cfg.BaseDomain, logger)
+	webuiSrv, err := webui.New(*addr, s, px, ss, portAlloc, cfg.BaseDomain, logger)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "webui: %v\n", err)
 		os.Exit(1)
 	}
-	mcpSrv := mcpserver.New(s, logger)
+	mcpSrv := mcpserver.New(s, portAlloc, logger)
 	acpSrv := acpserver.New(s, logger)
 	// Wire MCP server callbacks to webui so MCP tools can drive the full
 	// agentic flow: scan → inspect → register → reload → screenshot.
@@ -352,7 +360,7 @@ func combinedHandler(px *proxy.Proxy, webuiSrv *webui.Server, acm *acme.Manager,
 		}
 		// API + dashboard: webui
 		switch r.URL.Path {
-		case "/", "/routes", "/services", "/healthz":
+		case "/", "/routes", "/services", "/ports", "/healthz":
 			webuiSrv.Handler().ServeHTTP(w, r)
 			return
 		}

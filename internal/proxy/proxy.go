@@ -10,6 +10,7 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -147,10 +148,21 @@ func (p *Proxy) Reload() error {
 			continue
 		}
 		entry := &routeEntry{cfg: r}
+		// FlushInterval: -1 disables response buffering, which is
+		// required for streaming protocols (WebSocket, SSE, large
+		// downloads, etc.) so bytes flow through to the client as
+		// soon as the upstream writes them.
+		//
+		// The default Transport (http.DefaultTransport) already does
+		// hop-by-hop header stripping (Connection, Upgrade, etc.)
+		// and protocol-bridging for WebSocket — Go's stdlib
+		// ReverseProxy supports WS out of the box, as long as
+		// FlushInterval is set to a negative value.
 		entry.proxy = &httputil.ReverseProxy{
-			Director: p.makeDirector(r, upstream),
-			Transport: p.httpClient.Transport,
-			ErrorHandler: p.errorHandler(r),
+			Director:       p.makeDirector(r, upstream),
+			Transport:      p.httpClient.Transport,
+			ErrorHandler:   p.errorHandler(r),
+			FlushInterval:  -1,
 		}
 		entries[r.Host] = entry
 	}
@@ -394,6 +406,25 @@ func (s *statusRecorder) Flush() {
 	if f, ok := s.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// Hijack implements http.Hijacker so the underlying ReverseProxy can
+// upgrade the connection to a different protocol (most importantly
+// WebSocket). Without this, ws:// requests fail with
+// "can't switch protocols using non-Hijacker ResponseWriter type".
+//
+// We capture the hijacked status as "switching protocols" (101) so
+// the access log records the upgrade attempt.
+func (s *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := s.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, http.ErrNotSupported
+	}
+	if !s.wroteHeader {
+		s.status = http.StatusSwitchingProtocols
+		s.wroteHeader = true
+	}
+	return hj.Hijack()
 }
 
 // HealthCheckLoop runs periodic health probes for all routes in the background.

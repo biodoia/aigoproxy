@@ -38,6 +38,7 @@ import (
 
 	"github.com/biodoia/aigoproxy/internal/config"
 	"github.com/biodoia/aigoproxy/internal/detector"
+	"github.com/biodoia/aigoproxy/internal/ports"
 	"github.com/biodoia/aigoproxy/internal/proxy"
 	"github.com/biodoia/aigoproxy/internal/screenshot"
 	"github.com/biodoia/aigoproxy/internal/store"
@@ -96,6 +97,7 @@ type Server struct {
 	store  *store.Store
 	px     *proxy.Proxy
 	ss     *screenshot.Manager
+	ports  *ports.Allocator
 	logger *slog.Logger
 	tmpl   *template.Template
 
@@ -116,7 +118,7 @@ type Suggestion struct {
 }
 
 // New returns a new Server.
-func New(addr string, s *store.Store, px *proxy.Proxy, ss *screenshot.Manager, baseDomain string, logger *slog.Logger) (*Server, error) {
+func New(addr string, s *store.Store, px *proxy.Proxy, ss *screenshot.Manager, portAlloc *ports.Allocator, baseDomain string, logger *slog.Logger) (*Server, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -129,6 +131,7 @@ func New(addr string, s *store.Store, px *proxy.Proxy, ss *screenshot.Manager, b
 		store:      s,
 		px:         px,
 		ss:         ss,
+		ports:      portAlloc,
 		logger:     logger,
 		tmpl:       t,
 		baseDomain: baseDomain,
@@ -141,6 +144,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/routes", s.handleRoutes)
 	mux.HandleFunc("/services", s.handleServices)
+	mux.HandleFunc("/ports", s.handlePorts)
 	mux.HandleFunc("/api/routes", s.handleAPIRoutes)
 	mux.HandleFunc("/api/log", s.handleAPILog)
 	mux.HandleFunc("/api/stats", s.handleAPIStats)
@@ -150,6 +154,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/rescan", s.handleAPIRescan)
 	mux.HandleFunc("/api/enable-funnel", s.handleAPIEnableFunnel)
 	mux.HandleFunc("/api/suggestions", s.handleAPISuggestions)
+	mux.HandleFunc("/api/ports/list", s.handleAPIPortsList)
+	mux.HandleFunc("/api/ports/claim", s.handleAPIPortsClaim)
+	mux.HandleFunc("/api/ports/release", s.handleAPIPortsRelease)
 	mux.HandleFunc("/screenshots/", s.handleScreenshot)
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/static/", s.handleStatic)
@@ -312,6 +319,28 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
+// handlePorts shows the Memogo-backed port-allocator state at /ports.
+// Lists every reservation (port, owner, allocated_at, note) and the
+// "interesting" free ports — useful when an agent is about to start
+// a new service and needs to know what's available without scanning.
+func (s *Server) handlePorts(w http.ResponseWriter, r *http.Request) {
+	res, err := s.ports.List(r.Context())
+	if err != nil {
+		s.logger.Error("ports: list", "err", err)
+		http.Error(w, "port-allocator unreachable", http.StatusBadGateway)
+		return
+	}
+	data := struct {
+		Reservations []ports.Reservation
+		Free         []int
+		Total        int
+	}{res.Reservations, res.Free, len(res.Free)}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := s.tmpl.ExecuteTemplate(w, "ports.html", data); err != nil {
+		s.logger.Error("ports: template", "err", err)
+	}
+}
+
 func (s *Server) handleAPIRoutes(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	switch r.Method {
@@ -458,6 +487,75 @@ func (s *Server) handleAPIRescan(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAPISuggestions(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(s.lastRescan)
+}
+
+// handleAPIPortsList returns the port-allocator state as JSON.
+// Returns {reservations: [...], free: [...]}.
+func (s *Server) handleAPIPortsList(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	res, err := s.ports.List(r.Context())
+	if err != nil {
+		http.Error(w, "allocator: "+err.Error(), 502)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(res)
+}
+
+// handleAPIPortsClaim is POST. Body: {port, owner, note}. Returns
+// the ClaimResult as JSON. Idempotent for the same owner.
+func (s *Server) handleAPIPortsClaim(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Port  int    `json:"port"`
+		Owner string `json:"owner"`
+		Note  string `json:"note"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad body: "+err.Error(), 400)
+		return
+	}
+	if body.Port == 0 || body.Owner == "" {
+		http.Error(w, "port and owner required", 400)
+		return
+	}
+	res, err := s.ports.Claim(r.Context(), body.Port, body.Owner, body.Note)
+	if err != nil {
+		http.Error(w, "claim: "+err.Error(), 502)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	status := 200
+	if res.Status == "taken" {
+		status = 409
+	}
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(res)
+}
+
+// handleAPIPortsRelease is POST. Body: {port, owner}. Returns 200
+// on success, 403 if owner doesn't match, 404 if port not reserved.
+func (s *Server) handleAPIPortsRelease(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Port  int    `json:"port"`
+		Owner string `json:"owner"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad body: "+err.Error(), 400)
+		return
+	}
+	if err := s.ports.Release(r.Context(), body.Port, body.Owner); err != nil {
+		http.Error(w, err.Error(), 403)
+		return
+	}
+	w.WriteHeader(200)
+	_, _ = w.Write([]byte(`{"status":"released","port":` + fmt.Sprint(body.Port) + `}`))
 }
 
 func (s *Server) handleAPIEnableFunnel(w http.ResponseWriter, r *http.Request) {

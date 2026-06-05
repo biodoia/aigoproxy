@@ -53,7 +53,7 @@ func setup(t *testing.T) (http.Handler, *store.Store) {
 	if _, err := s.LoadConfig(); err != nil {
 		t.Fatal(err)
 	}
-	srv := New(s, slog.Default())
+	srv := New(s, nil, slog.Default())
 	return srv.Handler(), s
 }
 

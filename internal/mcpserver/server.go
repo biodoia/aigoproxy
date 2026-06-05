@@ -29,12 +29,14 @@ import (
 
 	"github.com/biodoia/aigoproxy/internal/config"
 	"github.com/biodoia/aigoproxy/internal/detector"
+	"github.com/biodoia/aigoproxy/internal/ports"
 	"github.com/biodoia/aigoproxy/internal/store"
 )
 
 // Server is the MCP server.
 type Server struct {
 	store    *store.Store
+	ports    *ports.Allocator
 	logger   *slog.Logger
 	onChange func() // optional: invoked after add/remove so caller can reload
 	scanFn   func() []any
@@ -49,12 +51,14 @@ func (s *Server) SetOnRouteChanged(fn func()) { s.onChange = fn }
 // aigoproxy_scan. Returns the slice of suggestions.
 func (s *Server) SetScan(fn func() []any) { s.scanFn = fn }
 
-// New returns a new MCP Server.
-func New(s *store.Store, logger *slog.Logger) *Server {
+// New returns a new MCP Server. The port allocator is optional (may
+// be nil for tests); when non-nil, the aigoproxy_ports_* tools
+// become available.
+func New(s *store.Store, portAlloc *ports.Allocator, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Server{store: s, logger: logger}
+	return &Server{store: s, ports: portAlloc, logger: logger}
 }
 
 // Handler returns the http.Handler.
@@ -260,6 +264,36 @@ func (s *Server) toolList() []toolDef {
 			Description: "Scan localhost for HTTP services and return a list of {port, title, has_auth, suggested_host, suggested_path} so the agent can pick which to expose. Mirrors /api/rescan.",
 			InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
 		},
+		{
+			Name:        "aigoproxy_ports_list",
+			Description: "List port reservations and the well-known free ports from the aigoproxy port-allocator. Mirrors GET /api/ports/list.",
+			InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
+		},
+		{
+			Name:        "aigoproxy_ports_claim",
+			Description: "Reserve a port for an owner (e.g. 'openwebui'). Returns {status: 'ok'|'owned'|'taken', port, owner?}. Use this BEFORE starting any new service that needs a port. If the port is taken, the caller should pick the next port in its fallback list and try again.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"port":  map[string]any{"type": "integer", "description": "Port number to reserve (1024-65535)"},
+					"owner": map[string]any{"type": "string", "description": "Service name claiming the port (e.g. 'openwebui')"},
+					"note":  map[string]any{"type": "string", "description": "Optional human-readable note"},
+				},
+				"required": []string{"port", "owner"},
+			},
+		},
+		{
+			Name:        "aigoproxy_ports_release",
+			Description: "Release a previously-claimed port. The owner field must match the original claim or the call fails.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"port":  map[string]any{"type": "integer", "description": "Port to release"},
+					"owner": map[string]any{"type": "string", "description": "Owner name used in the original claim"},
+				},
+				"required": []string{"port", "owner"},
+			},
+		},
 	}
 }
 
@@ -370,6 +404,45 @@ func (s *Server) toolCall(name string, args json.RawMessage) (any, error) {
 			return s.scanFn(), nil
 		}
 		return nil, nil
+	case "aigoproxy_ports_list":
+		if s.ports == nil {
+			return nil, fmt.Errorf("port allocator not configured")
+		}
+		return s.ports.List(context.Background())
+	case "aigoproxy_ports_claim":
+		if s.ports == nil {
+			return nil, fmt.Errorf("port allocator not configured")
+		}
+		var p struct {
+			Port  int    `json:"port"`
+			Owner string `json:"owner"`
+			Note  string `json:"note"`
+		}
+		if err := json.Unmarshal(args, &p); err != nil {
+			return nil, fmt.Errorf("bad args: %w", err)
+		}
+		if p.Port == 0 || p.Owner == "" {
+			return nil, fmt.Errorf("port and owner are required")
+		}
+		return s.ports.Claim(context.Background(), p.Port, p.Owner, p.Note)
+	case "aigoproxy_ports_release":
+		if s.ports == nil {
+			return nil, fmt.Errorf("port allocator not configured")
+		}
+		var p struct {
+			Port  int    `json:"port"`
+			Owner string `json:"owner"`
+		}
+		if err := json.Unmarshal(args, &p); err != nil {
+			return nil, fmt.Errorf("bad args: %w", err)
+		}
+		if p.Port == 0 || p.Owner == "" {
+			return nil, fmt.Errorf("port and owner are required")
+		}
+		if err := s.ports.Release(context.Background(), p.Port, p.Owner); err != nil {
+			return nil, err
+		}
+		return map[string]any{"status": "released", "port": p.Port}, nil
 	case "aigoproxy_remove":
 		var p struct {
 			Host string `json:"host"`

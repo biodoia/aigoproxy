@@ -655,6 +655,15 @@ func (s *Store) DumpState() error {
 // Close is a no-op for now.
 func (s *Store) Close() error { return nil }
 
+// API returns the underlying Memogo client so other packages (e.g.
+// the port allocator) can share the same connection pool and
+// configuration as the route store. The returned interface
+// matches ports.MemogoAPI so callers can pass it directly to
+// ports.New(api).
+func (s *Store) API() MemogoClient {
+	return s.api
+}
+
 // MemogoListForTest exposes V2List for tests in other packages. The
 // `ForTest` suffix is a hint to readers: this is a low-level escape
 // hatch that bypasses in-memory caching, so use it only to set up
