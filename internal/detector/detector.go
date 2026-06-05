@@ -167,6 +167,10 @@ func extractFirstHeading(html string) string {
 		if end < 0 {
 			continue
 		}
+		// bound check: we need end to be past the opening tag itself
+		if end < len(tag) {
+			end = len(tag)
+		}
 		return strings.TrimSpace(html[i+len(tag) : i+end])
 	}
 	return ""
@@ -182,6 +186,11 @@ func extractFormAction(html string) string {
 	if end < 0 {
 		return ""
 	}
+	// end is the offset of '>' within the substring lower[i:]; the tag is
+	// lower[i : i+end+1]. If end < len("<form"), something is malformed.
+	if end < len("<form") {
+		end = len("<form")
+	}
 	tag := html[i : i+end+1]
 	ai := strings.Index(strings.ToLower(tag), "action=")
 	if ai < 0 {
@@ -189,10 +198,13 @@ func extractFormAction(html string) string {
 	}
 	rest := tag[ai+8:]
 	// skip quote
+	if len(rest) == 0 {
+		return ""
+	}
 	quote := rest[0]
 	if quote != '"' && quote != '\'' {
 		// unquoted, read until space
-		end := strings.IndexAny(rest, " \t\n>")
+		end := strings.IndexAny(rest, " 	\n>")
 		if end < 0 {
 			return rest
 		}

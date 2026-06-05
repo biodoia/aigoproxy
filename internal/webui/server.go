@@ -552,6 +552,11 @@ func (s *Server) Suggestions() []Suggestion {
 // rescanPorts probes localhost on a list of well-known dev ports to
 // suggest new services to register.
 func (s *Server) rescanPorts(ctx context.Context) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			s.logger.Error("rescan panic", "err", rec)
+		}
+	}()
 	// Common service ports on Manjaro dev / home-server setups
 	ports := []int{
 		80, 443, 3000, 3001, 4000, 4040, 5000, 5001, 5050, 5173, 6000, 6001,

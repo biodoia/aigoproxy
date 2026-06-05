@@ -322,14 +322,28 @@ func (s *Server) toolCall(name string, args json.RawMessage) (any, error) {
 		}
 		// 1. Inspect
 		insp, _ := detector.Inspect(context.Background(), p.Upstream)
-		// 2. Pick auth
+		// 2. Pick auth. The semantics:
+		//   - "tailscale": request must come from a device in the tailnet
+		//     (Tailscale-User or X-Forwarded-For-Tailscale header). Use
+		//     this for routes accessed only via tailnet.
+		//   - "funnel": request comes from the public internet via
+		//     Tailscale Funnel. No client auth header is set; the
+		//     network path is the auth. Use this for routes that
+		//     are exposed publicly (typically anything with path_prefix).
+		//   - "none": no auth. The user is fully responsible.
 		auth := p.Auth
 		if auth == "" || auth == "auto" {
-			if insp != nil && !insp.HasAuth {
-				// service has no auth → must wrap it
-				auth = "tailscale"
-			} else {
+			switch {
+			case p.PathPrefix != "":
+				// Publicly exposed via Tailscale Funnel
+				auth = "funnel"
+			case insp != nil && insp.HasAuth:
+				// Service has its own login
 				auth = "none"
+			default:
+				// Service has no login and we are NOT publicly
+				// exposing it → require tailnet membership.
+				auth = "tailscale"
 			}
 		}
 		// 3. Add route

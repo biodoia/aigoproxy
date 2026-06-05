@@ -328,6 +328,12 @@ func combinedHandler(px *proxy.Proxy, webuiSrv *webui.Server, acm *acme.Manager,
 			webuiSrv.Handler().ServeHTTP(w, r)
 			return
 		}
+		// Multi-base-domain alias: if a request arrives with a host like
+		// "service.sapsucker-hirajoshi.ts.net" (the tailnet's actual
+		// MagicDNS name) but a route exists for "service.biodoia.ts.net"
+		// (the operator's preferred base), rewrite the Host header to
+		// the configured base so the lookup matches.
+		rewriteHostAlias(r, cfg.BaseDomain)
 		// Dashboard + API: served when Host is the node's own FQDN (or
 		// empty), so that requests to <route>.<base> are routed to the
 		// reverse proxy without intercepting the dashboard.
@@ -377,6 +383,7 @@ func nodeLocalHosts(cfg config.Config) []string {
 	return out
 }
 
+// contains reports whether x appears in s.
 func contains(s []string, x string) bool {
 	for _, v := range s {
 		if v == x {
@@ -384,6 +391,43 @@ func contains(s []string, x string) bool {
 		}
 	}
 	return false
+}
+
+// rewriteHostAlias translates a request's Host header so that the
+// configured `preferred` base domain takes precedence over the actual
+// Tailscale MagicDNS name. For example, if the operator chose
+// `biodoia.ts.net` as base_domain but the device's real tailnet name
+// is `sapsucker-hirajoshi.ts.net`, both should be accepted as route
+// hosts. We rewrite by swapping the suffix of the host.
+//
+// This is intentionally conservative: only act when the incoming host
+// already has a different suffix AND the routes config knows about
+// the preferred base.
+func rewriteHostAlias(r *http.Request, preferred string) {
+	if preferred == "" {
+		return
+	}
+	host := r.Host
+	if i := strings.IndexByte(host, ':'); i >= 0 {
+		host = host[:i]
+	}
+	host = strings.ToLower(host)
+	// If host already ends in the preferred base, no rewrite needed.
+	if strings.HasSuffix(host, "."+preferred) || host == preferred {
+		return
+	}
+	// Find the first dot to extract the subdomain
+	dot := strings.IndexByte(host, '.')
+	if dot < 0 {
+		return
+	}
+	sub := host[:dot]
+	newHost := sub + "." + preferred
+	r.Host = newHost
+	// Also rewrite the request's URL.Host (in case any code uses it).
+	if r.URL != nil {
+		r.URL.Host = newHost
+	}
 }
 
 // setupFunnel registers a Tailscale Funnel listener for every route marked
