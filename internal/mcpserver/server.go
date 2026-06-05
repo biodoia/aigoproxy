@@ -16,6 +16,8 @@
 //   aigoproxy_inspect — probe an upstream and report auth presence
 //   aigoproxy_register — one-shot: inspect + add + screenshot + funnel
 //   aigoproxy_scan    — port-scan localhost for HTTP services
+//   aigoproxy_purge   — garbage-collect tombstoned route entries in Memogo
+//   aigoproxy_health  — force a fresh health probe and return per-route status
 package mcpserver
 
 import (
@@ -40,6 +42,7 @@ type Server struct {
 	logger   *slog.Logger
 	onChange func() // optional: invoked after add/remove so caller can reload
 	scanFn   func() []any
+	probeFn  func() map[string]bool // optional: live health snapshot of every probed route
 }
 
 // SetOnRouteChanged registers a callback fired after aigoproxy_add and
@@ -50,6 +53,12 @@ func (s *Server) SetOnRouteChanged(fn func()) { s.onChange = fn }
 // SetScan registers a port-scan function the MCP server can call for
 // aigoproxy_scan. Returns the slice of suggestions.
 func (s *Server) SetScan(fn func() []any) { s.scanFn = fn }
+
+// SetProbe registers a function that returns a host→healthy snapshot
+// for every probed route. Powers the aigoproxy_health tool. The
+// callback should be cheap to call; the MCP tool may invoke it
+// several times per request.
+func (s *Server) SetProbe(fn func() map[string]bool) { s.probeFn = fn }
 
 // New returns a new MCP Server. The port allocator is optional (may
 // be nil for tests); when non-nil, the aigoproxy_ports_* tools
@@ -286,13 +295,28 @@ func (s *Server) toolList() []toolDef {
 			Name:        "aigoproxy_ports_release",
 			Description: "Release a previously-claimed port. The owner field must match the original claim or the call fails.",
 			InputSchema: map[string]any{
-				"type": "object",
+				"type":     "object",
 				"properties": map[string]any{
 					"port":  map[string]any{"type": "integer", "description": "Port to release"},
 					"owner": map[string]any{"type": "string", "description": "Owner name used in the original claim"},
 				},
 				"required": []string{"port", "owner"},
 			},
+		},
+		{
+			Name:        "aigoproxy_purge",
+			Description: "Garbage-collect tombstoned route entries in Memogo. Memogo v2 cannot physically delete keys (V2Delete returns 404), so removed routes are stored as tombstones. Calling this rewrites them with a __purged__ marker that keeps the audit trail but makes the row invisible to the live loader. Safe to call repeatedly: it is a no-op when there is nothing to purge.",
+			InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
+		},
+		{
+			Name:        "aigoproxy_health",
+			Description: "Return a live health snapshot for every route that has a Health check path configured. Status is true=up, false=down, omitted=never probed. Cheap to call.",
+			InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
+		},
+		{
+			Name:        "aigoproxy_prune",
+			Description: "Remove ghost routes (Host or Upstream blank) from the live config and tombstone the matching Memogo entries. Safe to call repeatedly: no-op when there is nothing to prune. Use this to clean up /api/routes after a buggy client posts empty forms.",
+			InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
 		},
 	}
 }
@@ -463,6 +487,47 @@ func (s *Server) toolCall(name string, args json.RawMessage) (any, error) {
 		return s.store.AccessLog(p.Limit), nil
 	case "aigoproxy_stats":
 		return s.store.Stats(), nil
+	case "aigoproxy_purge":
+		before, _ := s.store.TombstoneSummary()
+		n, err := s.store.PurgeTombstonesWithActor("mcp", "tombstone-purge-via-mcp")
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"status": "ok", "purged": n, "had_tombstones": before}, nil
+	case "aigoproxy_prune":
+		n, err := s.store.PruneInvalidRoutes()
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"status": "ok", "pruned": n}, nil
+	case "aigoproxy_health":
+		if s.probeFn == nil {
+			return map[string]any{"status": "unavailable", "reason": "probe fn not configured"}, nil
+		}
+		snap := s.probeFn()
+		// Decorate with route metadata so the agent doesn't have to
+		// call aigoproxy_list separately.
+		cfg := s.store.Config()
+		byHost := map[string]config.Route{}
+		for _, r := range cfg.Routes {
+			byHost[r.Host] = r
+		}
+		out := make([]map[string]any, 0, len(snap))
+		for host, healthy := range snap {
+			r := byHost[host]
+			out = append(out, map[string]any{
+				"host":    host,
+				"upstream": r.Upstream,
+				"health":  r.Health,
+				"enabled": r.Enabled,
+				"alive":   healthy,
+			})
+		}
+		return map[string]any{
+			"status":  "ok",
+			"probed":  len(out),
+			"routes":  out,
+		}, nil
 	}
 	return nil, fmt.Errorf("unknown tool: %s", name)
 }

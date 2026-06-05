@@ -1,10 +1,12 @@
 package store
 
 import (
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/biodoia/aigoproxy/internal/config"
 )
@@ -136,5 +138,131 @@ func TestRemoveMissing(t *testing.T) {
 	s.LoadConfig()
 	if err := s.RemoveRoute("nope.test.ts.net"); err == nil {
 		t.Error("expected error removing missing route")
+	}
+}
+
+// TestAddRouteValidatesHost ensures AddRoute refuses ghost routes
+// (blank Host or Upstream) instead of polluting the live config.
+func TestAddRouteValidatesHost(t *testing.T) {
+	s, _ := testStore(t)
+	if _, err := s.LoadConfig(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AddRoute(config.Route{Host: "", Upstream: "http://127.0.0.1:9000"}); err == nil {
+		t.Error("AddRoute with empty host should fail")
+	}
+	if _, err := s.AddRoute(config.Route{Host: "ok.test.ts.net", Upstream: ""}); err == nil {
+		t.Error("AddRoute with empty upstream should fail")
+	}
+	if _, err := s.AddRoute(config.Route{Host: "  ", Upstream: "http://127.0.0.1:9000"}); err == nil {
+		t.Error("AddRoute with whitespace host should fail")
+	}
+	if _, err := s.AddRoute(config.Route{Host: "real.test.ts.net", Upstream: "http://127.0.0.1:9000"}); err != nil {
+		t.Errorf("AddRoute valid: %v", err)
+	}
+}
+
+// TestPruneInvalidRoutes verifies the prune helper cleans up ghost
+// routes that snuck into the config through some legacy path.
+func TestPruneInvalidRoutes(t *testing.T) {
+	s, _ := testStore(t)
+	if _, err := s.LoadConfig(); err != nil {
+		t.Fatal(err)
+	}
+	// Seed a ghost route by writing directly to memogo with blank host.
+	// (The AddRoute validation prevents it going forward, but legacy
+	// state from before the fix may still have it.)
+	ghostBody, _ := json.Marshal(config.Route{Host: "", Upstream: ""})
+	if err := s.MemogoStoreForTest("route:", ghostBody, map[string]string{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AddRoute(config.Route{Host: "keeper.test.ts.net", Upstream: "http://127.0.0.1:9000"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LoadConfig(); err != nil {
+		t.Fatal(err)
+	}
+	// Pre-prune: should have at least 1 ghost (the one we just wrote).
+	hasGhost := false
+	for _, r := range s.Config().Routes {
+		if r.Host == "" {
+			hasGhost = true
+		}
+	}
+	if !hasGhost {
+		t.Fatal("setup: expected a ghost route to be present before prune")
+	}
+	n, err := s.PruneInvalidRoutes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n < 1 {
+		t.Errorf("expected prune >= 1, got %d", n)
+	}
+	for _, r := range s.Config().Routes {
+		if r.Host == "" {
+			t.Errorf("ghost route survived prune: %+v", r)
+		}
+	}
+}
+
+// TestTombstoneDataOnly verifies the load-time skip survives even
+// when the tombstone marker is only in the JSON body (i.e. memogo
+// has already dropped the custom __tombstone__ meta key). This is
+// the realistic state of aigoproxy running against memogo v2 today:
+// custom meta is silently stripped on round-trip, so the data-only
+// path is the one that actually fires in production.
+func TestTombstoneDataOnly(t *testing.T) {
+	s, _ := testStore(t)
+	if _, err := s.LoadConfig(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AddRoute(config.Route{Host: "victim.test.ts.net", Upstream: "http://127.0.0.1:9000", Auth: "none"}); err != nil {
+		t.Fatal(err)
+	}
+	// Confirm the route is live.
+	found := false
+	for _, r := range s.Config().Routes {
+		if r.Host == "victim.test.ts.net" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("victim route missing before tombstone")
+	}
+	// Now remove it — RemoveRouteWithActor writes the tombstone
+	// marker to BOTH meta and body. The fake preserves meta, so
+	// this also exercises the meta path.
+	if err := s.RemoveRouteWithActor("victim.test.ts.net", "test", "data-only-tombstone-test"); err != nil {
+		t.Fatal(err)
+	}
+	// Manually overwrite the entry with an empty meta to mimic
+	// memogo v2's round-trip. We poke through the in-process store
+	// API by re-storing with the tombstone body but no custom meta.
+	body, _ := json.Marshal(tombstoneData{
+		Tombstone:    "1",
+		RemovedBy:    "test",
+		RemovedAt:    time.Now().UTC().Format(time.RFC3339),
+		OriginalHost: "victim.test.ts.net",
+	})
+	if err := s.MemogoStoreForTest("route:victim.test.ts.net", body, map[string]string{}); err != nil {
+		t.Fatal(err)
+	}
+	// Reload and verify the route is gone.
+	if _, err := s.LoadConfig(); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range s.Config().Routes {
+		if r.Host == "victim.test.ts.net" {
+			t.Errorf("tombstoned route still present in cfg: %+v", r)
+		}
+	}
+	// TombstoneSummary should still find it via the body path.
+	n, err := s.TombstoneSummary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n < 1 {
+		t.Errorf("expected TombstoneSummary >= 1, got %d", n)
 	}
 }

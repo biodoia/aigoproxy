@@ -313,6 +313,45 @@ func (p *Proxy) isHealthy(host string) bool {
 	return b.Load()
 }
 
+// IsHealthy is the public alias of isHealthy, for /api/routes consumers
+// and the MCP health tool. Returns true if the route is currently up,
+// or true if no probe data is available yet (the proxy never blocks
+// requests on an unknown status).
+func (p *Proxy) IsHealthy(host string) bool { return p.isHealthy(host) }
+
+// HealthSnapshot returns a host→healthy map for all routes that have
+// been probed at least once. Hosts without probe data are omitted.
+func (p *Proxy) HealthSnapshot() map[string]bool {
+	out := map[string]bool{}
+	p.healthStatus.Range(func(k, v any) bool {
+		out[k.(string)] = v.(*atomic.Bool).Load()
+		return true
+	})
+	return out
+}
+
+// ProbeAll forces an immediate health probe of every enabled route
+// that has a Health check path configured. Used by the MCP health
+// tool and by /api/health/probe.
+func (p *Proxy) ProbeAll() { p.probeAll() }
+
+// ProbeOne forces an immediate health probe of a single route.
+// Returns the new status (true=up, false=down) or false if the route
+// has no Health check path configured (treated as "not probeable").
+func (p *Proxy) ProbeOne(host string) bool {
+	cfg := p.store.Config()
+	for _, r := range cfg.Routes {
+		if r.Host == host {
+			if !r.Enabled || r.Health == "" {
+				return false
+			}
+			p.probe(r)
+			return p.isHealthy(host)
+		}
+	}
+	return false
+}
+
 // checkAuth returns true if the request is allowed by the route's auth setting.
 func (p *Proxy) checkAuth(r config.Route, req *http.Request) bool {
 	switch r.Auth {

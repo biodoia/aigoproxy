@@ -157,6 +157,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/ports/list", s.handleAPIPortsList)
 	mux.HandleFunc("/api/ports/claim", s.handleAPIPortsClaim)
 	mux.HandleFunc("/api/ports/release", s.handleAPIPortsRelease)
+	mux.HandleFunc("/api/purge", s.handleAPIPurge)
+	mux.HandleFunc("/api/prune", s.handleAPIPrune)
+	mux.HandleFunc("/api/health/probe", s.handleAPIHealthProbe)
 	mux.HandleFunc("/screenshots/", s.handleScreenshot)
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/static/", s.handleStatic)
@@ -345,7 +348,25 @@ func (s *Server) handleAPIRoutes(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	switch r.Method {
 	case http.MethodGet:
-		_ = json.NewEncoder(w).Encode(s.store.Config().Routes)
+		// Decorate each route with its live health status (probed in
+		// the background by the proxy). Agents and dashboards can
+		// see at a glance which upstreams are currently reachable
+		// without a second round-trip to /api/health.
+		routes := s.store.Config().Routes
+		out := make([]map[string]any, 0, len(routes))
+		for _, r := range routes {
+			out = append(out, map[string]any{
+				"host":         r.Host,
+				"upstream":     r.Upstream,
+				"auth":         r.Auth,
+				"health":       r.Health,
+				"strip_prefix": r.StripPrefix,
+				"path_prefix":  r.PathPrefix,
+				"enabled":      r.Enabled,
+				"healthy_live": s.px.IsHealthy(r.Host),
+			})
+		}
+		_ = json.NewEncoder(w).Encode(out)
 	case http.MethodPost:
 		var body struct {
 			Host        string `json:"host"`
@@ -618,6 +639,67 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"now":      time.Now().Format(time.RFC3339),
 		"data_dir": s.store.DataDir(),
 		"stats":    s.store.Stats(),
+	})
+}
+
+// handleAPIPurge triggers a tombstone garbage-collection pass. It is
+// safe to call repeatedly; when there is nothing to purge it returns
+// {"purged": 0}. The route table itself is not affected because
+// tombstones are already filtered out of LoadConfig.
+func (s *Server) handleAPIPurge(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	before, _ := s.store.TombstoneSummary()
+	n, err := s.store.PurgeTombstonesWithActor("webui", "tombstone-purge-via-api")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":         "ok",
+		"purged":         n,
+		"had_tombstones": before,
+	})
+}
+
+// handleAPIHealthProbe forces an immediate health probe of every
+// enabled route that has a Health check path configured and returns
+// the resulting host→alive map. Useful for "is everything still
+// up?" dashboards that want fresh data instead of the periodic
+// background probe.
+func (s *Server) handleAPIHealthProbe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	s.px.ProbeAll()
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status": "ok",
+		"health": s.px.HealthSnapshot(),
+	})
+}
+
+// handleAPIPrune removes ghost routes (blank Host or Upstream) from
+// the live config and tombstones the matching Memogo entries. Use
+// this after a buggy client posts an empty form to /api/routes.
+func (s *Server) handleAPIPrune(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	n, err := s.store.PruneInvalidRoutes()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status": "ok",
+		"pruned": n,
 	})
 }
 

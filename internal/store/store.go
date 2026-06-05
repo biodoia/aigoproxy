@@ -58,6 +58,43 @@ type MemogoEntry struct {
 	Meta      map[string]string `json:"meta"`
 }
 
+// tombstoneData is the JSON body we write to mark a route as removed
+// when memogo v2 doesn't preserve our custom meta keys. The shape
+// must remain a JSON object so the loader can json.Unmarshal it and
+// then check isTombstonedData.
+type tombstoneData struct {
+	Tombstone  string `json:"__tombstone__"`
+	Purged     string `json:"__purged__,omitempty"`
+	RemovedBy  string `json:"removed_by,omitempty"`
+	RemovedAt  string `json:"removed_at,omitempty"`
+	PurgedBy   string `json:"purged_by,omitempty"`
+	PurgedAt   string `json:"purged_at,omitempty"`
+	OriginalHost string `json:"host,omitempty"`
+}
+
+// isTombstonedData reports whether a memogo entry's data payload
+// encodes a tombstone. The entry is base64-decoded first because
+// memogo stores data as a base64 string.
+func isTombstonedData(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	raw := data
+	if b, err := base64.StdEncoding.DecodeString(string(data)); err == nil && len(b) > 0 && b[0] == '{' {
+		raw = b
+	}
+	var t tombstoneData
+	if err := json.Unmarshal(raw, &t); err != nil {
+		return false
+	}
+	return t.Tombstone == "1"
+}
+
+// base64IfNeeded is a no-op kept for documentation: memogo's V2List
+// returns data already base64-decoded on the Go client, so callers
+// can pass the string directly to json.Unmarshal.
+var _ = base64.StdEncoding
+
 // AccessLogEntry is one row in the access log.
 type AccessLogEntry struct {
 	Time      time.Time `json:"time"`
@@ -303,8 +340,14 @@ func (s *Store) LoadConfig() (*config.Config, error) {
 		switch {
 		case strings.HasPrefix(e.Key, "route:"):
 			// Skip tombstoned routes (memogo has no real delete —
-			// we mark entries with __tombstone__ in meta instead).
+			// we mark entries with __tombstone__ in meta and/or in
+			// the JSON body itself, because memogo v2 silently
+			// drops custom meta keys on round-trip, so meta alone
+			// is unreliable).
 			if e.Meta["__tombstone__"] == "1" {
+				continue
+			}
+			if isTombstonedData([]byte(e.Data)) {
 				continue
 			}
 			var r config.Route
@@ -338,6 +381,16 @@ func (s *Store) AddRouteWithActor(r config.Route, actor, note string) (int, erro
 	defer s.mu.Unlock()
 	if s.cfg == nil {
 		s.cfg = &config.Config{}
+	}
+	// Reject empty host — it would create a ghost route that
+	// matches every un-routed request. This is a footgun: the
+	// /api/routes output used to show blank entries, which is
+	// almost always a bug, not a feature.
+	if strings.TrimSpace(r.Host) == "" {
+		return -1, fmt.Errorf("host is required")
+	}
+	if strings.TrimSpace(r.Upstream) == "" {
+		return -1, fmt.Errorf("upstream is required")
 	}
 	if r.Auth == "" {
 		r.Auth = "none"
@@ -393,9 +446,17 @@ func (s *Store) RemoveRouteWithActor(host, actor, note string) error {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			// Write a tombstone on the route key. The V2Store call
-			// overwrites the original entry with an empty route
-			// marked with __tombstone__ in meta.
-			data, _ := json.Marshal(map[string]any{})
+			// overwrites the original entry with a tombstone payload
+			// marked with __tombstone__ in BOTH meta (preferred,
+			// when memogo honors it) and the JSON body (mandatory,
+			// because memogo v2 silently drops custom meta keys on
+			// round-trip — see commit history).
+			data, _ := json.Marshal(tombstoneData{
+				Tombstone:  "1",
+				RemovedBy:  actor,
+				RemovedAt:  time.Now().UTC().Format(time.RFC3339),
+				OriginalHost: host,
+			})
 			if err := s.api.V2Store(ctx, s.ns, "route:"+host, data, map[string]string{
 				"__tombstone__": "1",
 				"removed_by":   actor,
@@ -415,7 +476,149 @@ func (s *Store) RemoveRouteWithActor(host, actor, note string) error {
 	return fmt.Errorf("route %q not found", host)
 }
 
-// UpdateRoute replaces the route with matching host.
+// TombstoneSummary returns a count of tombstoned route entries currently
+// sitting in Memogo. Use this before calling PurgeTombstones to confirm
+// there is something to clean up.
+func (s *Store) TombstoneSummary() (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	entries, err := s.api.V2List(ctx, s.ns)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Key, "route:") {
+			continue
+		}
+		if e.Meta["__tombstone__"] == "1" || isTombstonedData([]byte(e.Data)) {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// PurgeTombstonesWithActor garbage-collects tombstoned route entries in
+// Memogo. The aigoproxy store cannot physically delete rows (V2Delete
+// returns 404 in Memogo v2), so the only way to "forget" a removed
+// route is to overwrite the key with a __purged__ marker that all
+// future V2List consumers should ignore. The in-memory cfg is unchanged
+// because tombstones are already filtered out by LoadConfig.
+//
+// Returns the number of tombstones purged.
+func (s *Store) PurgeTombstonesWithActor(actor, note string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	entries, err := s.api.V2List(ctx, s.ns)
+	if err != nil {
+		return 0, err
+	}
+	purged := 0
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Key, "route:") {
+			continue
+		}
+		if e.Meta["__tombstone__"] != "1" && !isTombstonedData([]byte(e.Data)) {
+			continue
+		}
+		// Overwrite with a __purged__ marker. We intentionally do NOT
+		// delete the entry: V2Delete returns 404, and writing a new
+		// value lets audits still see "this route existed and was
+		// removed on <date> by <actor>" while making the row invisible
+		// to the live config loader.
+		host := strings.TrimPrefix(e.Key, "route:")
+		now := time.Now().UTC().Format(time.RFC3339)
+		data, _ := json.Marshal(tombstoneData{
+			Tombstone:    "1",
+			Purged:       "1",
+			PurgedBy:     actor,
+			PurgedAt:     now,
+			RemovedBy:    e.Meta["removed_by"],
+			OriginalHost: host,
+		})
+		if err := s.api.V2Store(ctx, s.ns, e.Key, data, map[string]string{
+			"__tombstone__": "1",
+			"__purged__":    "1",
+			"purged_by":     actor,
+			"purged_at":     now,
+			"type":          "route",
+		}); err != nil {
+			return purged, fmt.Errorf("purge %s: %w", e.Key, err)
+		}
+		s.auditLocked("purge", host, actor, e.Meta["removed_by"], "", note)
+		purged++
+	}
+	return purged, nil
+}
+
+// PurgeTombstones is PurgeTombstonesWithActor with default actor.
+func (s *Store) PurgeTombstones() (int, error) {
+	return s.PurgeTombstonesWithActor("cli", "")
+}
+
+// PruneInvalidRoutes removes from the live config any route whose
+// Host field is blank or whose Upstream is blank. These "ghost
+// routes" used to slip in when an MCP or webui client posted an
+// empty form, and they polluted /api/routes with blank rows. The
+// matching entries in Memogo are also tombstoned so the next
+// reload does not resurrect them. Returns the number of routes
+// pruned.
+func (s *Store) PruneInvalidRoutes() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cfg == nil {
+		return 0, nil
+	}
+	kept := s.cfg.Routes[:0]
+	pruned := 0
+	var prunedHosts []string
+	for _, r := range s.cfg.Routes {
+		if strings.TrimSpace(r.Host) == "" || strings.TrimSpace(r.Upstream) == "" {
+			prunedHosts = append(prunedHosts, r.Host)
+			pruned++
+			continue
+		}
+		kept = append(kept, r)
+	}
+	s.cfg.Routes = kept
+	s.stats.ActiveRoutes = len(kept)
+	s.stats.RouteKeys = len(kept)
+	if pruned > 0 {
+		_ = s.writeYAMLLocked()
+		// Also tombstone the matching memogo entries so the next
+		// LoadConfig does not see the ghost row again.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		for _, host := range prunedHosts {
+			body, _ := json.Marshal(tombstoneData{
+				Tombstone:    "1",
+				RemovedBy:    "prune",
+				RemovedAt:    time.Now().UTC().Format(time.RFC3339),
+				OriginalHost: host,
+			})
+			key := "route:" + host
+			if host == "" {
+				// In memogo a blank host is stored as just "route:",
+				// so the next reload would not match it on a Host
+				// field but would still list it on V2List. Tombstone
+				// the prefix instead.
+				key = "route:"
+			}
+			_ = s.api.V2Store(ctx, s.ns, key, body, map[string]string{
+				"__tombstone__": "1",
+				"removed_by":   "prune",
+				"removed_at":   time.Now().UTC().Format(time.RFC3339),
+				"type":         "route",
+			})
+			s.auditLocked("prune", host, "prune", "", "", "invalid-host-or-upstream")
+		}
+	}
+	return pruned, nil
+}
 func (s *Store) UpdateRoute(host string, r config.Route) error {
 	return s.UpdateRouteWithActor(host, r, "cli", "")
 }
@@ -692,6 +895,17 @@ func (s *Store) API() MemogoClient {
 func (s *Store) MemogoListForTest() ([]MemogoEntry, error) {
 	return s.api.V2List(context.Background(), s.ns)
 }
+
+// MemogoStoreForTest exposes V2Store for tests in other packages.
+// Use this to set up fixtures (e.g. a tombstone entry with empty
+// meta to mimic memogo v2 dropping custom keys on round-trip).
+func (s *Store) MemogoStoreForTest(key string, data []byte, meta map[string]string) error {
+	return s.api.V2Store(context.Background(), s.ns, key, data, meta)
+}
+
+// NamespaceForTest returns the memogo namespace this store reads
+// from and writes to. Tests use it to compose V2Store/V2Get calls.
+func (s *Store) NamespaceForTest() string { return s.ns }
 
 // MemogoDeleteForTest exposes V2Delete for tests in other packages.
 func (s *Store) MemogoDeleteForTest(key string) error {

@@ -194,6 +194,7 @@ func main() {
 		}
 		return out
 	})
+	mcpSrv.SetProbe(func() map[string]bool { return px.HealthSnapshot() })
 
 	// 6. Compose HTTP
 	root := http.NewServeMux()
