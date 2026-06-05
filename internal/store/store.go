@@ -302,6 +302,11 @@ func (s *Store) LoadConfig() (*config.Config, error) {
 	for _, e := range entries {
 		switch {
 		case strings.HasPrefix(e.Key, "route:"):
+			// Skip tombstoned routes (memogo has no real delete —
+			// we mark entries with __tombstone__ in meta instead).
+			if e.Meta["__tombstone__"] == "1" {
+				continue
+			}
 			var r config.Route
 			if err := json.Unmarshal([]byte(e.Data), &r); err == nil {
 				routes = append(routes, r)
@@ -369,6 +374,13 @@ func (s *Store) AddRouteWithActor(r config.Route, actor, note string) (int, erro
 func (s *Store) RemoveRoute(host string) error { return s.RemoveRouteWithActor(host, "cli", "") }
 
 // RemoveRouteWithActor is RemoveRoute with explicit actor attribution.
+//
+// Memogo v2 doesn't support delete (its /api/v2/delete endpoint always
+// returns 404), so we can't physically remove the entry. Instead we
+// write a tombstone marker (meta.__tombstone__="1") on the same key
+// and skip tombstoned routes in LoadConfig. The original route data
+// stays in Memogo for forensic/audit purposes but is invisible to
+// the proxy. Use V2Reap to garbage-collect tombstones later if needed.
 func (s *Store) RemoveRouteWithActor(host, actor, note string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -380,7 +392,16 @@ func (s *Store) RemoveRouteWithActor(host, actor, note string) error {
 			ob, _ := json.Marshal(r)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			if err := s.api.V2Delete(ctx, s.ns, "route:"+host); err != nil {
+			// Write a tombstone on the route key. The V2Store call
+			// overwrites the original entry with an empty route
+			// marked with __tombstone__ in meta.
+			data, _ := json.Marshal(map[string]any{})
+			if err := s.api.V2Store(ctx, s.ns, "route:"+host, data, map[string]string{
+				"__tombstone__": "1",
+				"removed_by":   actor,
+				"removed_at":   time.Now().UTC().Format(time.RFC3339),
+				"type":         "route",
+			}); err != nil {
 				return err
 			}
 			s.cfg.Routes = append(s.cfg.Routes[:i], s.cfg.Routes[i+1:]...)
