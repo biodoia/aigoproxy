@@ -3,14 +3,19 @@ package mcpserver
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"log/slog"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/biodoia/aigoproxy/internal/store"
 )
+
+var mcpTestNSCounter atomic.Int64
 
 func rpcCall(t *testing.T, h http.Handler, method string, params any) rpcResponse {
 	t.Helper()
@@ -35,6 +40,12 @@ func rpcCall(t *testing.T, h http.Handler, method string, params any) rpcRespons
 func setup(t *testing.T) (http.Handler, *store.Store) {
 	t.Helper()
 	dir := t.TempDir()
+	// Per-test unique memogo namespace (counter + random) so tests
+	// don't collide with each other or with production data. Memogo
+	// has no delete API in v2, so unique namespaces are the only
+	// way to keep state isolated across runs.
+	ns := fmt.Sprintf("aigoproxy_test_%d_%d", mcpTestNSCounter.Add(1), rand.Int63())
+	t.Setenv("AIGOPROXY_NAMESPACE", ns)
 	s, err := store.New(dir)
 	if err != nil {
 		t.Fatal(err)

@@ -3,11 +3,14 @@ package acpserver
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,9 +20,13 @@ import (
 	"github.com/biodoia/aigoproxy/internal/store"
 )
 
+var acpTestNSCounter atomic.Int64
+
 func setupACP(t *testing.T) (*store.Store, http.Handler) {
 	t.Helper()
 	dir := t.TempDir()
+	ns := fmt.Sprintf("aigoproxy_test_%d_%d", acpTestNSCounter.Add(1), rand.Int63())
+	t.Setenv("AIGOPROXY_NAMESPACE", ns)
 	s, err := store.New(dir)
 	if err != nil {
 		t.Fatal(err)

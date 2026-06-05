@@ -1,7 +1,9 @@
 package store
 
 import (
-	"path/filepath"
+	"fmt"
+	"math/rand"
+	"sync/atomic"
 	"testing"
 
 	"github.com/biodoia/aigoproxy/internal/config"
@@ -9,13 +11,13 @@ import (
 
 // testStore is a helper that returns a Store wired to a unique
 // namespace so tests don't collide with each other or with the real
-// `aigoproxy` production namespace.
+// `aigoproxy` production namespace. Each test gets a unique
+// namespace (counter + random suffix) so we never have to clean
+// memogo between runs.
 func testStore(t *testing.T) (*Store, string) {
 	t.Helper()
 	dir := t.TempDir()
-	// Set env so the production New() picks the test namespace. We
-	// use a per-test unique suffix.
-	ns := "aigoproxy_test_" + filepath.Base(dir)
+	ns := fmt.Sprintf("aigoproxy_test_%d_%d", testStoreCounter.Add(1), rand.Int63())
 	t.Setenv("AIGOPROXY_NAMESPACE", ns)
 	s, err := New(dir)
 	if err != nil {
@@ -23,6 +25,8 @@ func testStore(t *testing.T) (*Store, string) {
 	}
 	return s, ns
 }
+
+var testStoreCounter atomic.Int64
 
 func TestNew(t *testing.T) {
 	s, _ := testStore(t)

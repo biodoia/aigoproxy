@@ -1,18 +1,23 @@
 package proxy
 
 import (
+	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/biodoia/aigoproxy/internal/config"
 	"github.com/biodoia/aigoproxy/internal/store"
 )
+
+var testNSCounter atomic.Int64
 
 // startTestUpstream starts a small HTTP test server and returns its URL.
 // It registers a cleanup hook to close itself when the test ends.
@@ -26,6 +31,12 @@ func startTestUpstream(t *testing.T, handler http.HandlerFunc) (url string) {
 func newTestProxy(t *testing.T) (*Proxy, *store.Store) {
 	t.Helper()
 	dir := t.TempDir()
+	// Per-test unique memogo namespace (counter + random) so the test
+	// store doesn't collide with the production 'aigoproxy' namespace
+	// in memogo or with other tests. Memogo has no delete API, so we
+	// rely on unique namespaces to keep state isolated across runs.
+	ns := fmt.Sprintf("aigoproxy_test_%d_%d", testNSCounter.Add(1), rand.Int63())
+	t.Setenv("AIGOPROXY_NAMESPACE", ns)
 	s, err := store.New(dir)
 	if err != nil {
 		t.Fatal(err)

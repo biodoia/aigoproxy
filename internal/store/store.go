@@ -655,6 +655,25 @@ func (s *Store) DumpState() error {
 // Close is a no-op for now.
 func (s *Store) Close() error { return nil }
 
+// MemogoListForTest exposes V2List for tests in other packages. The
+// `ForTest` suffix is a hint to readers: this is a low-level escape
+// hatch that bypasses in-memory caching, so use it only to set up
+// or tear down fixtures, not to read state in the normal flow.
+func (s *Store) MemogoListForTest() ([]MemogoEntry, error) {
+	return s.api.V2List(context.Background(), s.ns)
+}
+
+// MemogoDeleteForTest exposes V2Delete for tests in other packages.
+func (s *Store) MemogoDeleteForTest(key string) error {
+	return s.api.V2Delete(context.Background(), s.ns, key)
+}
+
+// ReloadConfigForTest re-runs LoadConfig so callers see the current
+// memogo state (e.g. after deleting entries).
+func (s *Store) ReloadConfigForTest() {
+	_, _ = s.LoadConfig()
+}
+
 // --- helpers (must be called with s.mu held) ---
 
 func (s *Store) writeYAMLLocked() error {
