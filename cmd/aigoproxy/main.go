@@ -352,7 +352,7 @@ func combinedHandler(px *proxy.Proxy, webuiSrv *webui.Server, acm *acme.Manager,
 		}
 		// API + dashboard: webui
 		switch r.URL.Path {
-		case "/", "/routes", "/healthz":
+		case "/", "/routes", "/services", "/healthz":
 			webuiSrv.Handler().ServeHTTP(w, r)
 			return
 		}

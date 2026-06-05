@@ -140,6 +140,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/routes", s.handleRoutes)
+	mux.HandleFunc("/services", s.handleServices)
 	mux.HandleFunc("/api/routes", s.handleAPIRoutes)
 	mux.HandleFunc("/api/log", s.handleAPILog)
 	mux.HandleFunc("/api/stats", s.handleAPIStats)
@@ -296,6 +297,19 @@ func (s *Server) handleRoutes(w http.ResponseWriter, r *http.Request) {
 	}{Title: "aigoproxy — routes", Routes: s.routesView()}); err != nil {
 		s.logger.Error("template", "err", err)
 	}
+}
+
+// handleServices serves the static catalog of FGT services at /services.
+// The page is a pre-rendered HTML file embedded from the static/ dir.
+func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
+	data, err := staticFS.ReadFile("static/services.html")
+	if err != nil {
+		http.Error(w, "services page not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	_, _ = w.Write(data)
 }
 
 func (s *Server) handleAPIRoutes(w http.ResponseWriter, r *http.Request) {

@@ -24,6 +24,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -189,10 +190,10 @@ func (m *HTTPMemogoClient) V2List(ctx context.Context, ns string) ([]MemogoEntry
 	}
 	var out struct {
 		Entries []struct {
-			Namespace string            `json:"Namespace"`
-			Key       string            `json:"Key"`
-			Content   []byte            `json:"Content"`
-			Meta      map[string]string `json:"Meta"`
+			Namespace string            `json:"namespace"`
+			Key       string            `json:"key"`
+			Data      string            `json:"data"`
+			Meta      map[string]string `json:"meta"`
 		} `json:"entries"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -200,9 +201,15 @@ func (m *HTTPMemogoClient) V2List(ctx context.Context, ns string) ([]MemogoEntry
 	}
 	res := make([]MemogoEntry, 0, len(out.Entries))
 	for _, e := range out.Entries {
-		// Memogo returns base64-encoded Content; decode to string
+		// Memogo's list endpoint returns base64-encoded content in the
+		// "data" field. Decode to plain string so callers see JSON or
+		// other content as-is.
+		decoded, derr := decodeIfBase64(e.Data)
+		if derr != nil {
+			decoded = e.Data // fall back to raw if it isn't base64
+		}
 		res = append(res, MemogoEntry{
-			Namespace: e.Namespace, Key: e.Key, Data: string(e.Content), Meta: e.Meta,
+			Namespace: e.Namespace, Key: e.Key, Data: decoded, Meta: e.Meta,
 		})
 	}
 	return res, nil
@@ -246,10 +253,14 @@ func New(dataDir string) (*Store, error) {
 	if memogoURL == "" {
 		memogoURL = "http://localhost:8081"
 	}
+	ns := os.Getenv("AIGOPROXY_NAMESPACE")
+	if ns == "" {
+		ns = "aigoproxy"
+	}
 	api := NewHTTPMemogo(memogoURL)
 	s := &Store{
 		dataDir:   dataDir,
-		ns:        "aigoproxy",
+		ns:        ns,
 		api:       api,
 		http:      api.HTTP,
 		accessLog: make([]AccessLogEntry, 0, 1024),
@@ -755,3 +766,33 @@ func guessBaseDomain(routes []config.Route) string {
 // Used by tests + tail helper.
 var _ = bufio.NewScanner
 var _ = io.EOF
+
+// decodeIfBase64 tries to base64-decode s. If the input doesn't look
+// like base64 (length, chars, or padding) the original string is
+// returned unchanged with err=nil — we don't want to fail loudly when
+// memogo evolves to return plain text in some endpoints.
+func decodeIfBase64(s string) (string, error) {
+	if s == "" {
+		return s, nil
+	}
+	// Memogo's encoded content is roughly len*4/3 with padding.
+	if len(s)%4 != 0 {
+		return s, nil
+	}
+	decoded, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return s, nil
+	}
+	// Heuristic: if decoded is mostly printable, prefer it. Otherwise
+	// treat the input as raw text.
+	printable := 0
+	for _, r := range decoded {
+		if r == 0x09 || r == 0x0a || r == 0x0d || (r >= 0x20 && r < 0x7f) || r >= 0x80 {
+			printable++
+		}
+	}
+	if printable < len(decoded)*9/10 {
+		return s, nil
+	}
+	return string(decoded), nil
+}

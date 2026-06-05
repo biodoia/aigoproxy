@@ -7,20 +7,32 @@ import (
 	"github.com/biodoia/aigoproxy/internal/config"
 )
 
-func TestNew(t *testing.T) {
+// testStore is a helper that returns a Store wired to a unique
+// namespace so tests don't collide with each other or with the real
+// `aigoproxy` production namespace.
+func testStore(t *testing.T) (*Store, string) {
+	t.Helper()
 	dir := t.TempDir()
-	s, err := New(filepath.Join(dir, "sub"))
+	// Set env so the production New() picks the test namespace. We
+	// use a per-test unique suffix.
+	ns := "aigoproxy_test_" + filepath.Base(dir)
+	t.Setenv("AIGOPROXY_NAMESPACE", ns)
+	s, err := New(dir)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	return s, ns
+}
+
+func TestNew(t *testing.T) {
+	s, _ := testStore(t)
 	if s.DataDir() == "" {
 		t.Error("DataDir empty")
 	}
 }
 
 func TestAddRemoveRoute(t *testing.T) {
-	dir := t.TempDir()
-	s, _ := New(dir)
+	s, _ := testStore(t)
 	if _, err := s.LoadConfig(); err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
@@ -45,8 +57,7 @@ func TestAddRemoveRoute(t *testing.T) {
 }
 
 func TestAddDuplicateRoute(t *testing.T) {
-	dir := t.TempDir()
-	s, _ := New(dir)
+	s, _ := testStore(t)
 	s.LoadConfig()
 	_, _ = s.AddRoute(config.Route{Host: "a.test.ts.net", Upstream: "http://1.1.1.1:80"})
 	_, err := s.AddRoute(config.Route{Host: "a.test.ts.net", Upstream: "http://1.1.1.1:81"})
@@ -56,8 +67,7 @@ func TestAddDuplicateRoute(t *testing.T) {
 }
 
 func TestLookupRoute(t *testing.T) {
-	dir := t.TempDir()
-	s, _ := New(dir)
+	s, _ := testStore(t)
 	s.LoadConfig()
 	_, _ = s.AddRoute(config.Route{Host: "a.test.ts.net", Upstream: "http://1.1.1.1:80"})
 	_, _ = s.AddRoute(config.Route{Host: "b.test.ts.net", Upstream: "http://1.1.1.1:81"})
@@ -77,8 +87,7 @@ func TestLookupRoute(t *testing.T) {
 }
 
 func TestLogAccess(t *testing.T) {
-	dir := t.TempDir()
-	s, _ := New(dir)
+	s, _ := testStore(t)
 	s.LogAccess(AccessLogEntry{Host: "x", Method: "GET", Path: "/", Status: 200, LatencyMs: 5})
 	s.LogAccess(AccessLogEntry{Host: "y", Method: "GET", Path: "/", Status: 500, LatencyMs: 100})
 	if got := len(s.AccessLog(10)); got != 2 {
@@ -91,8 +100,7 @@ func TestLogAccess(t *testing.T) {
 }
 
 func TestStats(t *testing.T) {
-	dir := t.TempDir()
-	s, _ := New(dir)
+	s, _ := testStore(t)
 	stats := s.Stats()
 	if stats.StartedAt.IsZero() {
 		t.Error("StartedAt should be set")
@@ -103,8 +111,7 @@ func TestStats(t *testing.T) {
 }
 
 func TestSetRouteEnabled(t *testing.T) {
-	dir := t.TempDir()
-	s, _ := New(dir)
+	s, _ := testStore(t)
 	s.LoadConfig()
 	_, _ = s.AddRoute(config.Route{Host: "a.test.ts.net", Upstream: "http://1.1.1.1:80"})
 	if err := s.SetRouteEnabled("a.test.ts.net", false); err != nil {
@@ -121,8 +128,7 @@ func TestSetRouteEnabled(t *testing.T) {
 }
 
 func TestRemoveMissing(t *testing.T) {
-	dir := t.TempDir()
-	s, _ := New(dir)
+	s, _ := testStore(t)
 	s.LoadConfig()
 	if err := s.RemoveRoute("nope.test.ts.net"); err == nil {
 		t.Error("expected error removing missing route")
